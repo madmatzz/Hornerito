@@ -6,6 +6,7 @@
     "dotenv": "^16.4.7",
     "express": "^4.21.2",
     "natural": "^8.0.1",
+    "node-nlp": "^5.0.0-alpha.5",
     "openai": "^3.2.1",
     "telegraf": "^4.16.3"
   },
