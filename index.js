@@ -5,23 +5,34 @@ const sqlite3 = require('better-sqlite3');
 const { Telegraf, Markup, session } = require('telegraf');
 const path = require('path');
 const categorizer = require('./categorizer');
-const OpenAI = require('openai');
+const { OpenAI } = require('openai');
 const Database = require('better-sqlite3');
 
 const app = express();
+
+// API middleware - must come FIRST
 app.use(express.json());
+
+// Add CORS middleware
+app.use((req, res, next) => {
+    res.header('Access-Control-Allow-Origin', '*');
+    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
+    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
+    if (req.method === 'OPTIONS') {
+        return res.sendStatus(200);
+    }
+    next();
+});
 
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
 bot.use(session());
 
-// Serve static files from the public directory
-app.use(express.static(path.join(__dirname, 'public')));
-
 // Create a specific data directory
 const DATA_DIR = path.join(__dirname, 'data');
 if (!require('fs').existsSync(DATA_DIR)) {
-  require('fs').mkdirSync(DATA_DIR);
+    console.log('Creating data directory:', DATA_DIR);
+    require('fs').mkdirSync(DATA_DIR, { recursive: true });
 }
 
 // Use absolute path for database
@@ -80,6 +91,18 @@ const initDatabase = () => {
         console.log('Expenses table columns:', expensesColumns.map(c => c.name));
         console.log('Recurring expenses table columns:', recurringColumns.map(c => c.name));
 
+        // Add test data if tables are empty
+        const expenseCount = db.prepare('SELECT COUNT(*) as count FROM expenses').get();
+        if (expenseCount.count === 0) {
+            console.log('Adding test expense data...');
+            db.prepare(`
+                INSERT INTO expenses (user_id, amount, category, description, timestamp)
+                VALUES 
+                ('test_user', 50.00, 'Food & Drinks > Meals', 'Test Meal', datetime('now')),
+                ('test_user', 30.00, 'Transport > Taxi', 'Test Ride', datetime('now'))
+            `).run();
+        }
+
     } catch (error) {
         console.error('Error initializing database:', {
             message: error.message,
@@ -90,8 +113,154 @@ const initDatabase = () => {
     }
 };
 
-// Make sure database is initialized when app starts
+// Initialize database
 initDatabase();
+
+// API Routes
+app.get('/api/expenses', (req, res) => {
+    try {
+        console.log('Fetching all expenses...');
+
+        // Get regular expenses
+        const regularExpenses = db.prepare(`
+            SELECT 
+                id,
+                user_id,
+                amount,
+                category,
+                description,
+                timestamp as date,
+                0 as is_recurring,
+                NULL as frequency
+            FROM expenses 
+        `).all() || [];
+
+        console.log('Regular expenses:', regularExpenses);
+
+        // Get recurring expenses
+        const recurringExpenses = db.prepare(`
+            SELECT 
+                id,
+                user_id,
+                amount,
+                category,
+                description,
+                last_tracked as date,
+                1 as is_recurring,
+                frequency
+            FROM recurring_expenses
+            WHERE active = 1
+        `).all() || [];
+
+        console.log('Recurring expenses:', recurringExpenses);
+
+        // Combine and format
+        const allExpenses = [...regularExpenses, ...recurringExpenses]
+            .map(exp => ({
+                id: exp.id,
+                amount: parseFloat(exp.amount),
+                category: exp.category,
+                displayCategory: exp.category.includes('>') 
+                    ? exp.category.split('>')[1].trim() 
+                    : exp.category.trim(),
+                description: exp.description || 'Unnamed expense',
+                date: exp.date || new Date().toISOString(),
+                is_recurring: Boolean(exp.is_recurring),
+                frequency: exp.frequency || null
+            }))
+            .sort((a, b) => new Date(b.date) - new Date(a.date));
+
+        console.log('Sending formatted expenses:', allExpenses);
+        res.json(allExpenses);
+
+    } catch (error) {
+        console.error('Error fetching expenses:', error);
+        res.status(500).json({ error: 'Failed to fetch expenses' });
+    }
+});
+
+// Update the recent expenses endpoint
+app.get('/api/recent-expenses', (req, res) => {
+    try {
+        // Get regular expenses
+        const regularExpenses = db.prepare(`
+            SELECT 
+                'regular' as type,
+                id,
+                amount,
+                category,
+                description,
+                timestamp as date
+            FROM expenses 
+            ORDER BY timestamp DESC
+            LIMIT 5
+        `).all() || [];
+
+        // Get recurring expenses
+        const recurringExpenses = db.prepare(`
+            SELECT 
+                'recurring' as type,
+                id,
+                amount,
+                category,
+                description,
+                last_tracked as date,
+                frequency
+            FROM recurring_expenses
+            WHERE active = 1
+            ORDER BY last_tracked DESC
+            LIMIT 5
+        `).all() || [];
+
+        // Combine and format all expenses
+        const allExpenses = [...regularExpenses, ...recurringExpenses]
+            .map(exp => ({
+                id: exp.id,
+                amount: parseFloat(exp.amount),
+                category: exp.category || 'Uncategorized',
+                displayCategory: exp.category ? exp.category.split('>')[1]?.trim() || exp.category : 'Uncategorized',
+                description: exp.description || exp.category || 'Unnamed expense',
+                date: exp.date || new Date().toISOString(),
+                is_recurring: exp.type === 'recurring',
+                frequency: exp.frequency || null
+            }))
+            .sort((a, b) => new Date(b.date) - new Date(a.date))
+            .slice(0, 5);
+
+        console.log('Sending recent expenses:', allExpenses);
+        res.json(allExpenses);
+
+    } catch (error) {
+        console.error('Error in recent expenses:', error);
+        res.status(500).json({ error: 'Failed to fetch recent expenses' });
+    }
+});
+
+app.get('/api/recurring-expenses', async (req, res) => {
+    try {
+        const expenses = db.prepare(`
+            SELECT * FROM recurring_expenses 
+            WHERE active = 1
+            ORDER BY frequency, amount
+        `).all();
+
+        res.json(expenses);
+    } catch (error) {
+        console.error('Error fetching recurring expenses:', error);
+        res.status(500).json({ error: 'Error fetching recurring expenses' });
+    }
+});
+
+// Serve the Next.js dashboard
+app.use('/_next', express.static(path.join(__dirname, 'v0 dashboard/.next')));
+app.use(express.static(path.join(__dirname, 'v0 dashboard/out')));
+
+// Catch-all route for Next.js pages
+app.get('*', (req, res) => {
+    if (!req.path.startsWith('/api')) {
+        res.sendFile(path.join(__dirname, 'v0 dashboard/out/dashboard.html'));
+    }
+});
 
 // Add error handling for database connection
 process.on('SIGINT', () => {
@@ -324,68 +493,6 @@ function formatLogTime(date = new Date()) {
   });
 }
 
-// Update the expenses API route
-app.get('/api/expenses', (req, res) => {
-    try {
-        console.log('Fetching all expenses...');
-
-        // Get regular expenses
-        const regularExpenses = db.prepare(`
-            SELECT 
-                id,
-                user_id,
-                amount,
-                category,
-                description,
-                timestamp as date,
-                0 as is_recurring,
-                NULL as frequency
-            FROM expenses 
-        `).all() || [];
-
-        // Get recurring expenses
-        const recurringExpenses = db.prepare(`
-            SELECT 
-                id,
-                user_id,
-                amount,
-                category,
-                description,
-                last_tracked as date,
-                1 as is_recurring,
-                frequency
-            FROM recurring_expenses
-            WHERE active = 1
-        `).all() || [];
-
-        // Combine and format
-        const allExpenses = [...regularExpenses, ...recurringExpenses]
-            .map(exp => ({
-                id: exp.id,
-                amount: parseFloat(exp.amount),
-                category: exp.category,
-                displayCategory: exp.category.includes('>') 
-                    ? exp.category.split('>')[1].trim() 
-                    : exp.category.trim(),
-                description: exp.description || 'Unnamed expense',
-                date: exp.date || new Date().toISOString(),
-                is_recurring: Boolean(exp.is_recurring),
-                frequency: exp.frequency || null
-            }))
-            .sort((a, b) => new Date(b.date) - new Date(a.date));
-
-        console.log('Sending formatted expenses:', allExpenses);
-        res.json(allExpenses);
-
-    } catch (error) {
-        console.error('Error fetching expenses:', error);
-        res.status(500).json({ 
-            error: 'Failed to fetch expenses',
-            details: error.message
-        });
-    }
-});
-
 // Add a test endpoint to check database status
 app.get('/api/debug', (req, res) => {
     try {
@@ -426,62 +533,6 @@ app.delete('/api/expenses/:id', (req, res) => {
     }
 });
 
-// Update the recent expenses endpoint
-app.get('/api/recent-expenses', (req, res) => {
-    try {
-        // Get regular expenses
-        const regularExpenses = db.prepare(`
-            SELECT 
-                'regular' as type,
-                id,
-                amount,
-                category,
-                description,
-                timestamp as date
-            FROM expenses 
-            ORDER BY timestamp DESC
-            LIMIT 5
-        `).all() || [];
-
-        // Get recurring expenses
-        const recurringExpenses = db.prepare(`
-            SELECT 
-                'recurring' as type,
-                id,
-                amount,
-                category,
-                description,
-                last_tracked as date,
-                frequency
-            FROM recurring_expenses
-            WHERE active = 1
-            ORDER BY last_tracked DESC
-            LIMIT 5
-        `).all() || [];
-
-        // Combine and format all expenses
-        const allExpenses = [...regularExpenses, ...recurringExpenses]
-            .map(exp => ({
-                id: exp.id,
-                amount: parseFloat(exp.amount),
-                category: exp.category || 'Uncategorized',
-                description: exp.description || exp.category || 'Unnamed expense',
-                date: exp.date || new Date().toISOString(),
-                is_recurring: exp.type === 'recurring',
-                frequency: exp.frequency || null
-            }))
-            .sort((a, b) => new Date(b.date) - new Date(a.date))
-            .slice(0, 5);
-
-        console.log('Sending expenses:', allExpenses);
-        res.json(allExpenses);
-
-    } catch (error) {
-        console.error('Error in recent expenses:', error);
-        res.status(500).json({ error: 'Failed to fetch recent expenses' });
-    }
-});
-
 // Add this endpoint to check the database status
 app.get('/api/status', (req, res) => {
     try {
@@ -499,27 +550,6 @@ app.get('/api/status', (req, res) => {
         });
     } catch (error) {
         res.status(500).json({ error: error.message });
-    }
-});
-
-// Serve the dashboard
-app.get('/', (req, res) => {
-    res.sendFile(path.join(__dirname, 'public', 'index.html'));
-});
-
-// Add this with your other Express routes
-app.get('/api/recurring-expenses', async (req, res) => {
-    try {
-        const expenses = db.prepare(`
-            SELECT * FROM recurring_expenses 
-            WHERE active = 1
-            ORDER BY frequency, amount
-        `).all();
-
-        res.json(expenses);
-    } catch (error) {
-        console.error('Error fetching recurring expenses:', error);
-        res.status(500).json({ error: 'Error fetching recurring expenses' });
     }
 });
 
