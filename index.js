@@ -599,7 +599,7 @@ function isGreeting(text) {
 const POSITIVE_RESPONSES = ['great', 'good', 'nice', 'thanks', 'thank', 'awesome', 'cool', 'perfect'];
 const GREETINGS = ['hey', 'hello', 'hi', 'hola', 'help', 'start'];
 
-// Initialize OpenAI client
+// Initialize OpenAI
 const openai = new OpenAI({
     apiKey: process.env.OPENAI_API_KEY
 });

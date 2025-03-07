@@ -1,7 +1,7 @@
 const natural = require('natural');
 const nlp = require('compromise');
 const { NlpManager } = require('node-nlp');
-const { Configuration, OpenAIApi } = require('openai');
+const { OpenAI } = require('openai');
 
 class SmartCategorizer {
   constructor() {
@@ -15,11 +15,10 @@ class SmartCategorizer {
     
     this.classifier = new natural.BayesClassifier();
     
-    // Initialize OpenAI using the new syntax
-    const configuration = new Configuration({
+    // Initialize OpenAI
+    this.openai = new OpenAI({
       apiKey: process.env.OPENAI_API_KEY
     });
-    this.openai = new OpenAIApi(configuration);
 
     console.log('🤖 Initializing categorizer...');
 
@@ -102,7 +101,7 @@ class SmartCategorizer {
 
   async askGPT(item) {
     try {
-      const response = await this.openai.createChatCompletion({
+      const response = await this.openai.chat.completions.create({
         model: "gpt-3.5-turbo",
         messages: [{
           role: "system",
@@ -115,7 +114,7 @@ class SmartCategorizer {
         max_tokens: 20
       });
 
-      return response.data.choices[0].message.content.trim();
+      return response.choices[0].message.content.trim();
     } catch (error) {
       console.error('GPT API error:', error);
       return null;
