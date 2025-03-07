@@ -611,7 +611,7 @@ async function learnNewCategory(description, userCategory) {
         const message = `Learn this expense categorization: "${description}" should be categorized as "${userCategory}". 
                         Please update your categorization knowledge accordingly.`;
         
-        await openai.chat.completions.create({
+        const completion = await openai.chat.completions.create({
             model: "gpt-3.5-turbo",
             messages: [
                 { role: "system", content: "You are a helpful expense categorizer. Learn from user corrections to improve future categorizations." },
