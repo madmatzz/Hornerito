@@ -5,7 +5,7 @@ const sqlite3 = require('better-sqlite3');
 const { Telegraf, Markup, session } = require('telegraf');
 const path = require('path');
 const categorizer = require('./categorizer');
-const { OpenAI } = require('openai');
+const { Configuration, OpenAIApi } = require('openai');
 const Database = require('better-sqlite3');
 
 const app = express();
@@ -600,9 +600,10 @@ const POSITIVE_RESPONSES = ['great', 'good', 'nice', 'thanks', 'thank', 'awesome
 const GREETINGS = ['hey', 'hello', 'hi', 'hola', 'help', 'start'];
 
 // Initialize OpenAI
-const openai = new OpenAI({
+const configuration = new Configuration({
     apiKey: process.env.OPENAI_API_KEY
 });
+const openai = new OpenAIApi(configuration);
 
 // Update the learnNewCategory function to use the correct OpenAI client
 async function learnNewCategory(description, userCategory) {
@@ -611,7 +612,7 @@ async function learnNewCategory(description, userCategory) {
         const message = `Learn this expense categorization: "${description}" should be categorized as "${userCategory}". 
                         Please update your categorization knowledge accordingly.`;
         
-        const completion = await openai.chat.completions.create({
+        const completion = await openai.createChatCompletion({
             model: "gpt-3.5-turbo",
             messages: [
                 { role: "system", content: "You are a helpful expense categorizer. Learn from user corrections to improve future categorizations." },
