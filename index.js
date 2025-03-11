@@ -1,71 +1,159 @@
 require('dotenv').config();
 const express = require('express');
 const axios = require('axios');
-const sqlite3 = require('better-sqlite3');
-const { Telegraf, Markup, session } = require('telegraf');
+const sqlite3 = require('sqlite3').verbose();
+const { Telegraf, Markup } = require('telegraf');
+const LocalSession = require('telegraf-session-local');
 const path = require('path');
 const categorizer = require('./categorizer');
-const { Configuration, OpenAIApi } = require('openai');
-const Database = require('better-sqlite3');
+const OpenAI = require('openai');
+const cors = require('cors');
+const compression = require('compression');
+
+console.log('\n🤖 Starting Hornerito Bot...\n');
 
 const app = express();
 
-// API middleware - must come FIRST
+// Enable compression
+app.use(compression());
+
+// API middleware
+console.log('📚 Initializing middleware...');
 app.use(express.json());
 
-// Add CORS middleware
-app.use((req, res, next) => {
-    res.header('Access-Control-Allow-Origin', '*');
-    res.header('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE, OPTIONS');
-    res.header('Access-Control-Allow-Headers', 'Origin, X-Requested-With, Content-Type, Accept');
-    if (req.method === 'OPTIONS') {
-        return res.sendStatus(200);
-    }
-    next();
-});
+// Update CORS configuration with caching headers
+app.use(cors({
+    origin: ['http://localhost:3000', 'http://localhost:3001'],
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'Cache-Control', 'Pragma', 'Expires'],
+    credentials: true,
+    maxAge: 300 // Cache preflight requests for 5 minutes
+}));
 
+console.log('🔑 Loading environment variables...');
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
-const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
-bot.use(session());
-
-// Create a specific data directory
-const DATA_DIR = path.join(__dirname, 'data');
-if (!require('fs').existsSync(DATA_DIR)) {
-    console.log('Creating data directory:', DATA_DIR);
-    require('fs').mkdirSync(DATA_DIR, { recursive: true });
+if (!TELEGRAM_BOT_TOKEN) {
+    console.error('❌ Error: TELEGRAM_BOT_TOKEN not found in environment variables');
+    process.exit(1);
 }
 
-// Use absolute path for database
-const DB_PATH = path.join(DATA_DIR, 'hornerito.db');
-console.log('Database path:', DB_PATH);
+console.log('🤖 Initializing Telegram bot...');
+const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
 
-// Update database initialization
-const db = new Database(DB_PATH);
+// Configure local session middleware
+const localSession = new LocalSession({
+    database: 'data/session.json',
+    property: 'session',
+    storage: LocalSession.storageMemory,
+    format: {
+        serialize: (obj) => JSON.stringify(obj, null, 2),
+        deserialize: (str) => JSON.parse(str),
+    },
+    state: {
+        editingExpenseId: null,
+        originalCategory: null,
+        originalAmount: null,
+        userId: null
+    },
+    // Add this to prevent using deprecated util._extend
+    extend: (sessionData, defaultData) => Object.assign({}, defaultData, sessionData)
+});
+
+// Ensure data directory exists
+const fs = require('fs');
+const dataDir = path.join(__dirname, 'data');
+if (!fs.existsSync(dataDir)) {
+    fs.mkdirSync(dataDir, { recursive: true });
+    console.log('Created data directory:', dataDir);
+}
+
+// Use the local session middleware
+bot.use(localSession.middleware());
+
+// Add session debug middleware with more detailed logging
+bot.use((ctx, next) => {
+    if (ctx.from) {
+        const sessionId = ctx.from.id || 'unknown';
+        console.log(`\n🔍 Session state for user ${sessionId}:`, JSON.stringify(ctx.session, null, 2));
+    }
+    return next();
+});
+
+// Use absolute path for database
+const DB_PATH = path.join(dataDir, 'hornerito.db');
+console.log('💾 Database path:', DB_PATH);
+
+// Update database initialization with better error handling and persistence
+console.log('🔌 Connecting to database...');
+const db = new sqlite3.Database(DB_PATH, (err) => {
+    if (err) {
+        console.error('❌ Error opening database:', err);
+        process.exit(1);
+    }
+    console.log('  └─ Successfully connected to database');
+});
+
+// Enable foreign keys and WAL mode for better data persistence
+console.log('⚙️  Configuring database settings...');
+db.serialize(() => {
+    db.run('PRAGMA foreign_keys = ON');
+    db.run('PRAGMA journal_mode = WAL');
+    console.log('  └─ Database settings configured');
+});
 
 const initDatabase = () => {
+    return new Promise((resolve, reject) => {
     try {
         console.log('Initializing database schema...');
         
-        // Create expenses table
-        db.prepare(`
+            // Create expenses table if it doesn't exist
+            db.run(`
             CREATE TABLE IF NOT EXISTS expenses (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id TEXT NOT NULL,
                 amount REAL NOT NULL,
                 category TEXT,
+                    subcategory TEXT,
                 description TEXT,
                 timestamp TEXT NOT NULL,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
-        `).run();
+            `, (err) => {
+                if (err) {
+                    console.error('Error creating expenses table:', err);
+                    reject(err);
+                    return;
+                }
 
-        // Create recurring_expenses table
-        db.prepare(`
+                // Add subcategory column if it doesn't exist
+                db.get(`SELECT COUNT(*) as count FROM pragma_table_info('expenses') WHERE name='subcategory'`, [], (err, row) => {
+                    if (err) {
+                        console.error('Error checking for subcategory column:', err);
+                        reject(err);
+                        return;
+                    }
+
+                    if (row.count === 0) {
+                        console.log('Adding subcategory column to expenses table...');
+                        db.run(`ALTER TABLE expenses ADD COLUMN subcategory TEXT`, [], (err) => {
+                            if (err && !err.message.includes('duplicate column')) {
+                                console.error('Error adding subcategory column:', err);
+                                reject(err);
+                                return;
+                            }
+                            console.log('Successfully added subcategory column');
+                        });
+                    }
+                });
+
+                // Create recurring_expenses table if it doesn't exist
+                db.run(`
             CREATE TABLE IF NOT EXISTS recurring_expenses (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id TEXT NOT NULL,
                 amount REAL NOT NULL,
                 category TEXT,
+                        subcategory TEXT,
                 description TEXT,
                 frequency TEXT NOT NULL,
                 start_date TEXT NOT NULL,
@@ -73,106 +161,111 @@ const initDatabase = () => {
                 active INTEGER DEFAULT 1,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
             )
-        `).run();
+                `, (err) => {
+                    if (err) {
+                        console.error('Error creating recurring_expenses table:', err);
+                        reject(err);
+                        return;
+                    }
 
-        // Verify tables were created
-        const tables = db.prepare(`
-            SELECT name FROM sqlite_master 
-            WHERE type='table' 
-            AND name IN ('expenses', 'recurring_expenses')
-        `).all();
-        
-        console.log('Created tables:', tables);
+                    // Add subcategory column if it doesn't exist
+                    db.get(`SELECT COUNT(*) as count FROM pragma_table_info('recurring_expenses') WHERE name='subcategory'`, [], (err, row) => {
+                        if (err) {
+                            console.error('Error checking for subcategory column:', err);
+                            reject(err);
+                            return;
+                        }
 
-        // Verify columns in each table
-        const expensesColumns = db.prepare("PRAGMA table_info(expenses)").all();
-        const recurringColumns = db.prepare("PRAGMA table_info(recurring_expenses)").all();
-        
-        console.log('Expenses table columns:', expensesColumns.map(c => c.name));
-        console.log('Recurring expenses table columns:', recurringColumns.map(c => c.name));
+                        if (row.count === 0) {
+                            console.log('Adding subcategory column to recurring_expenses table...');
+                            db.run(`ALTER TABLE recurring_expenses ADD COLUMN subcategory TEXT`, [], (err) => {
+                                if (err && !err.message.includes('duplicate column')) {
+                                    console.error('Error adding subcategory column:', err);
+                                    reject(err);
+                                    return;
+                                }
+                                console.log('Successfully added subcategory column');
+                            });
+                        }
 
-        // Add test data if tables are empty
-        const expenseCount = db.prepare('SELECT COUNT(*) as count FROM expenses').get();
-        if (expenseCount.count === 0) {
-            console.log('Adding test expense data...');
-            db.prepare(`
-                INSERT INTO expenses (user_id, amount, category, description, timestamp)
-                VALUES 
-                ('test_user', 50.00, 'Food & Drinks > Meals', 'Test Meal', datetime('now')),
-                ('test_user', 30.00, 'Transport > Taxi', 'Test Ride', datetime('now'))
-            `).run();
+                        // Verify tables and data
+                        db.all(`SELECT COUNT(*) as count FROM expenses`, [], (err, result) => {
+                            if (err) {
+                                console.error('Error counting expenses:', err);
+                            } else {
+                                console.log('Current number of expenses:', result[0].count);
+                            }
+                            resolve();
+                        });
+                    });
+                });
+            });
+        } catch (error) {
+            console.error('Error initializing database:', error);
+            reject(error);
         }
-
-    } catch (error) {
-        console.error('Error initializing database:', {
-            message: error.message,
-            stack: error.stack,
-            code: error.code
-        });
-        throw error;
-    }
+    });
 };
 
 // Initialize database
-initDatabase();
+initDatabase().catch(console.error);
 
 // API Routes
 app.get('/api/expenses', (req, res) => {
     try {
         console.log('Fetching all expenses...');
-
-        // Get regular expenses
-        const regularExpenses = db.prepare(`
+        
+        // Use a single query with UNION to get both regular and recurring expenses
+        db.all(`
             SELECT 
                 id,
                 user_id,
                 amount,
                 category,
+                subcategory,
                 description,
                 timestamp as date,
                 0 as is_recurring,
                 NULL as frequency
             FROM expenses 
-        `).all() || [];
-
-        console.log('Regular expenses:', regularExpenses);
-
-        // Get recurring expenses
-        const recurringExpenses = db.prepare(`
+            UNION ALL
             SELECT 
                 id,
                 user_id,
                 amount,
                 category,
+                subcategory,
                 description,
                 last_tracked as date,
                 1 as is_recurring,
                 frequency
             FROM recurring_expenses
             WHERE active = 1
-        `).all() || [];
+            ORDER BY date DESC
+        `, (err, expenses) => {
+            if (err) {
+                console.error('Error fetching expenses:', err);
+                res.status(500).json({ error: 'Failed to fetch expenses' });
+                return;
+            }
 
-        console.log('Recurring expenses:', recurringExpenses);
-
-        // Combine and format
-        const allExpenses = [...regularExpenses, ...recurringExpenses]
-            .map(exp => ({
-                id: exp.id,
+            // Format expenses
+            const formattedExpenses = expenses.map(exp => ({
+                ...exp,
                 amount: parseFloat(exp.amount),
-                category: exp.category,
-                displayCategory: exp.category.includes('>') 
-                    ? exp.category.split('>')[1].trim() 
-                    : exp.category.trim(),
-                description: exp.description || 'Unnamed expense',
-                date: exp.date || new Date().toISOString(),
-                is_recurring: Boolean(exp.is_recurring),
-                frequency: exp.frequency || null
-            }))
-            .sort((a, b) => new Date(b.date) - new Date(a.date));
+                category: exp.category || 'Uncategorized',
+                subcategory: exp.subcategory || 'Other',
+                description: exp.description || 'Unnamed expense'
+            }));
 
-        console.log('Sending formatted expenses:', allExpenses);
-        res.json(allExpenses);
+            // Set cache headers
+            res.set({
+                'Cache-Control': 'public, max-age=300', // Cache for 5 minutes
+                'Expires': new Date(Date.now() + 300000).toUTCString()
+            });
 
+            res.json(formattedExpenses);
+        });
     } catch (error) {
         console.error('Error fetching expenses:', error);
         res.status(500).json({ error: 'Failed to fetch expenses' });
@@ -183,26 +276,33 @@ app.get('/api/expenses', (req, res) => {
 app.get('/api/recent-expenses', (req, res) => {
     try {
         // Get regular expenses
-        const regularExpenses = db.prepare(`
+        db.all(`
             SELECT 
                 'regular' as type,
                 id,
                 amount,
                 category,
+                subcategory,
                 description,
                 timestamp as date
             FROM expenses 
             ORDER BY timestamp DESC
             LIMIT 5
-        `).all() || [];
+        `, [], (err, regularExpenses) => {
+            if (err) {
+                console.error('Error fetching regular expenses:', err);
+                res.status(500).json({ error: 'Failed to fetch recent expenses' });
+                return;
+            }
 
         // Get recurring expenses
-        const recurringExpenses = db.prepare(`
+            db.all(`
             SELECT 
                 'recurring' as type,
                 id,
                 amount,
                 category,
+                    subcategory,
                 description,
                 last_tracked as date,
                 frequency
@@ -210,16 +310,21 @@ app.get('/api/recent-expenses', (req, res) => {
             WHERE active = 1
             ORDER BY last_tracked DESC
             LIMIT 5
-        `).all() || [];
+            `, [], (err, recurringExpenses) => {
+                if (err) {
+                    console.error('Error fetching recurring expenses:', err);
+                    res.status(500).json({ error: 'Failed to fetch recent expenses' });
+                    return;
+                }
 
         // Combine and format all expenses
-        const allExpenses = [...regularExpenses, ...recurringExpenses]
+                const allExpenses = [...(regularExpenses || []), ...(recurringExpenses || [])]
             .map(exp => ({
                 id: exp.id,
                 amount: parseFloat(exp.amount),
                 category: exp.category || 'Uncategorized',
-                displayCategory: exp.category ? exp.category.split('>')[1]?.trim() || exp.category : 'Uncategorized',
-                description: exp.description || exp.category || 'Unnamed expense',
+                        subcategory: exp.subcategory || 'Other',
+                        description: exp.description || 'Unnamed expense',
                 date: exp.date || new Date().toISOString(),
                 is_recurring: exp.type === 'recurring',
                 frequency: exp.frequency || null
@@ -229,7 +334,8 @@ app.get('/api/recent-expenses', (req, res) => {
 
         console.log('Sending recent expenses:', allExpenses);
         res.json(allExpenses);
-
+            });
+        });
     } catch (error) {
         console.error('Error in recent expenses:', error);
         res.status(500).json({ error: 'Failed to fetch recent expenses' });
@@ -238,27 +344,48 @@ app.get('/api/recent-expenses', (req, res) => {
 
 app.get('/api/recurring-expenses', async (req, res) => {
     try {
-        const expenses = db.prepare(`
+        db.all(`
             SELECT * FROM recurring_expenses 
             WHERE active = 1
             ORDER BY frequency, amount
-        `).all();
+        `, [], (err, expenses) => {
+            if (err) {
+                console.error('Error fetching recurring expenses:', err);
+                res.status(500).json({ error: 'Error fetching recurring expenses' });
+                return;
+            }
 
-        res.json(expenses);
+            // Format the expenses to match the expected interface
+            const formattedExpenses = expenses.map(exp => ({
+                id: exp.id,
+                amount: parseFloat(exp.amount),
+                category: exp.category || 'Uncategorized',
+                subcategory: exp.subcategory || 'Other',
+                displayCategory: exp.category?.includes('>') 
+                    ? exp.category.split('>')[1].trim() 
+                    : exp.category?.trim() || 'Uncategorized',
+                description: exp.description || 'Unnamed expense',
+                date: exp.last_tracked || new Date().toISOString(),
+                is_recurring: true,
+                frequency: exp.frequency
+            }));
+
+            res.json(formattedExpenses);
+        });
     } catch (error) {
         console.error('Error fetching recurring expenses:', error);
         res.status(500).json({ error: 'Error fetching recurring expenses' });
     }
 });
 
-// Serve the Next.js dashboard
-app.use('/_next', express.static(path.join(__dirname, 'v0 dashboard/.next')));
-app.use(express.static(path.join(__dirname, 'v0 dashboard/out')));
+// Update the dashboard serving code
+app.use('/_next', express.static(path.join(__dirname, 'v0.0.1-dashboard/.next')));
+app.use(express.static(path.join(__dirname, 'v0.0.1-dashboard/out')));
 
 // Catch-all route for Next.js pages
 app.get('*', (req, res) => {
     if (!req.path.startsWith('/api')) {
-        res.sendFile(path.join(__dirname, 'v0 dashboard/out/dashboard.html'));
+        res.sendFile(path.join(__dirname, 'v0.0.1-dashboard/out/index.html'));
     }
 });
 
@@ -314,6 +441,8 @@ const categoryMap = {
   'water': 'Bills & Utilities > Water',
   'internet': 'Bills & Utilities > Internet & Phone',
   'phone': 'Bills & Utilities > Internet & Phone',
+  'taxes': 'Bills & Utilities > Taxes',
+  'tax': 'Bills & Utilities > Taxes',
   
   // Miscellaneous
   'gift': 'Miscellaneous > Gifts',
@@ -368,6 +497,10 @@ const categoryKeywords = {
   ],
   'Shopping > Groceries': [
     'groceries', 'supermarket', 'market', 'store', 'walmart', 'target'
+  ],
+  'Bills & Utilities > Taxes': [
+    'tax', 'taxes', 'irs', 'income tax', 'property tax', 'sales tax',
+    'tax payment', 'tax bill', 'tax return', 'taxation'
   ],
   'Bills & Utilities > Electricity': [
     'electricity', 'power', 'electric', 'energy'
@@ -440,32 +573,75 @@ function isFoodRelated(word) {
   );
 }
 
-function categorizeExpense(input) {
+async function categorizeExpense(input) {
+    try {
+        // First try to use GPT for smart categorization
+        const response = await openai.chat.completions.create({
+            model: "gpt-3.5-turbo",
+            messages: [
+                {
+                    role: "system",
+                    content: `You are an expense categorizer. Categorize expenses into these categories:
+                    - Food & Drinks (subcategories: Meals, Snacks, Drinks)
+                    - Transport (subcategories: Taxis & Rideshares, Fuel / Gas, Public Transport)
+                    - Shopping (subcategories: Clothing, Electronics, Groceries)
+                    - Entertainment (subcategories: Games, Movies & Streaming, Music / Concerts)
+                    - Bills & Utilities (subcategories: Electricity, Water, Internet & Phone, Taxes)
+                    - Health (subcategories: Medical, Pharmacy, Fitness)
+                    - Miscellaneous (subcategories: Gifts, Subscriptions, Other)
+                    
+                    Respond ONLY with a JSON object containing 'category' and 'subcategory'.`
+                },
+                {
+                    role: "user",
+                    content: `Categorize this expense: ${input}`
+                }
+            ],
+            temperature: 0.3,
+            max_tokens: 100
+        });
+
+        try {
+            const gptResult = JSON.parse(response.choices[0].message.content);
+            if (gptResult.category && gptResult.subcategory) {
+                console.log('✅ GPT categorized as:', gptResult);
+                return gptResult;
+            }
+        } catch (e) {
+            console.log('GPT parsing failed, falling back to basic categorization');
+        }
+    } catch (error) {
+        console.log('OpenAI call failed, falling back to basic categorization');
+    }
+
+    // Fallback to basic categorization
   const word = input.toLowerCase().trim();
   
-  // First try exact matches from the previous categoryMap
+    // First try exact matches from the categoryMap
   if (categoryMap[word]) {
-    return categoryMap[word];
+        const [category, subcategory] = categoryMap[word].split(' > ');
+        return { category, subcategory: subcategory || 'Other' };
   }
 
   // Then try to find the best matching category based on keywords
-  for (const [category, keywords] of Object.entries(categoryKeywords)) {
+    for (const [fullCategory, keywords] of Object.entries(categoryKeywords)) {
     if (keywords.some(keyword => 
       word.includes(keyword) || keyword.includes(word)
     )) {
-      return category;
+            const [category, subcategory] = fullCategory.split(' > ');
+            return { category, subcategory: subcategory || 'Other' };
     }
   }
 
-  // Check if it's food-related using our smart function
+    // Check if it's food-related
   if (isFoodRelated(word)) {
-    return 'Food & Drinks > Meals';
+        return { category: 'Food & Drinks', subcategory: 'Meals' };
   }
 
-  // If still no match, check for transport-related words
+    // Check for transport-related words
   const transportWords = [
     'transport', 'travel', 'ride', 'vehicle', 'car', 'bus', 'train',
-    'taxi', 'uber', 'lyft', 'cab', 'metro', 'subway', 'bike'
+        'taxi', 'uber', 'lyft', 'cab', 'metro', 'subway', 'bike', 'gas', 'fuel'
   ];
 
   const isTransportRelated = transportWords.some(transportWord => 
@@ -473,11 +649,14 @@ function categorizeExpense(input) {
   );
 
   if (isTransportRelated) {
-    return 'Transport > Other';
+        if (word.includes('gas') || word.includes('fuel')) {
+            return { category: 'Transport', subcategory: 'Fuel' };
+        }
+        return { category: 'Transport', subcategory: 'Other' };
   }
 
   // Default fallback
-  return `Miscellaneous > Other > ${input}`;
+    return { category: 'Miscellaneous', subcategory: 'Other' };
 }
 
 // Add this helper function at the top of your file
@@ -497,10 +676,10 @@ function formatLogTime(date = new Date()) {
 app.get('/api/debug', (req, res) => {
     try {
         const dbStatus = {
-            expenses: db.prepare('SELECT COUNT(*) as count FROM expenses').get(),
-            recurring: db.prepare('SELECT COUNT(*) as count FROM recurring_expenses WHERE active = 1').get(),
-            expensesColumns: db.prepare('PRAGMA table_info(expenses)').all(),
-            recurringColumns: db.prepare('PRAGMA table_info(recurring_expenses)').all()
+            expenses: db.get(`SELECT COUNT(*) as count FROM expenses`),
+            recurring: db.get(`SELECT COUNT(*) as count FROM recurring_expenses WHERE active = 1`),
+            expensesColumns: db.all(`PRAGMA table_info(expenses)`),
+            recurringColumns: db.all(`PRAGMA table_info(recurring_expenses)`)
         };
         res.json(dbStatus);
     } catch (error) {
@@ -512,7 +691,7 @@ app.get('/api/debug', (req, res) => {
 app.delete('/api/expenses/all', (req, res) => {
     try {
         console.log('Attempting to delete all expenses...');
-        const result = db.prepare('DELETE FROM expenses').run();
+        const result = db.run('DELETE FROM expenses');
         console.log('Delete all result:', result);
         res.json({ success: true, message: 'All expenses deleted' });
     } catch (error) {
@@ -523,29 +702,35 @@ app.delete('/api/expenses/all', (req, res) => {
 
 // Individual delete route should come after
 app.delete('/api/expenses/:id', (req, res) => {
-    try {
-        const { id } = req.params;
-        db.prepare('DELETE FROM expenses WHERE id = ?').run(id);
-        res.json({ success: true });
-    } catch (error) {
-        console.error('Error deleting expense:', error);
-        res.status(500).json({ error: 'Error deleting expense' });
-    }
+    const expenseId = req.params.id;
+    
+    db.run('DELETE FROM expenses WHERE id = ?', [expenseId], function(err) {
+        if (err) {
+            console.error('Error deleting expense:', err);
+            return res.status(500).json({ error: 'Failed to delete expense' });
+        }
+        
+        if (this.changes === 0) {
+            return res.status(404).json({ error: 'Expense not found' });
+        }
+        
+        res.json({ message: 'Expense deleted successfully' });
+    });
 });
 
 // Add this endpoint to check the database status
 app.get('/api/status', (req, res) => {
     try {
-        const expensesCount = db.prepare('SELECT COUNT(*) as count FROM expenses').get();
-        const recurringCount = db.prepare('SELECT COUNT(*) as count FROM recurring_expenses WHERE active = 1').get();
+        const expensesCount = db.get(`SELECT COUNT(*) as count FROM expenses`);
+        const recurringCount = db.get(`SELECT COUNT(*) as count FROM recurring_expenses WHERE active = 1`);
         
         res.json({
             status: 'ok',
             expenses: expensesCount.count,
             recurring: recurringCount.count,
             tables: [
-                db.prepare("PRAGMA table_info(expenses)").all(),
-                db.prepare("PRAGMA table_info(recurring_expenses)").all()
+                db.all(`PRAGMA table_info(expenses)`),
+                db.all(`PRAGMA table_info(recurring_expenses)`)
             ]
         });
     } catch (error) {
@@ -553,10 +738,66 @@ app.get('/api/status', (req, res) => {
     }
 });
 
+// Add PUT endpoint for updating expenses
+app.put('/api/expenses/:id', (req, res) => {
+    const expenseId = req.params.id;
+    const { amount, category, subcategory, description, date, is_recurring, frequency } = req.body;
+    
+    try {
+        if (is_recurring) {
+            db.run(
+                `UPDATE recurring_expenses 
+                SET amount = ?, category = ?, subcategory = ?, description = ?, 
+                    last_tracked = ?, frequency = ?
+                WHERE id = ?`,
+                [amount, category, subcategory, description, date, frequency, expenseId],
+                function(err) {
+                    if (err) {
+                        console.error('Error updating recurring expense:', err);
+                        return res.status(500).json({ error: 'Failed to update expense' });
+                    }
+                    
+                    if (this.changes === 0) {
+                        return res.status(404).json({ error: 'Expense not found' });
+                    }
+                    
+                    res.json({ message: 'Expense updated successfully' });
+                }
+            );
+        } else {
+            db.run(
+                `UPDATE expenses 
+                SET amount = ?, category = ?, subcategory = ?, description = ?, 
+                    timestamp = ?
+                WHERE id = ?`,
+                [amount, category, subcategory, description, date, expenseId],
+                function(err) {
+                    if (err) {
+                        console.error('Error updating expense:', err);
+                        return res.status(500).json({ error: 'Failed to update expense' });
+                    }
+                    
+                    if (this.changes === 0) {
+                        return res.status(404).json({ error: 'Expense not found' });
+                    }
+                    
+                    res.json({ message: 'Expense updated successfully' });
+                }
+            );
+        }
+    } catch (error) {
+        console.error('Error updating expense:', error);
+        res.status(500).json({ error: 'Failed to update expense' });
+    }
+});
+
 // Start the server
-const PORT = process.env.PORT || 3000;
+const PORT = process.env.PORT || 3001;
 app.listen(PORT, () => {
-    console.log(`Server running on port ${PORT}`);
+    console.log('\n🚀 Server is ready!');
+    console.log(`   └─ Running on port ${PORT}`);
+    console.log(`   └─ Dashboard: http://localhost:3000`);
+    console.log(`   └─ API endpoint: http://localhost:${PORT}/api`);
 });
 
 // Start command
@@ -566,8 +807,7 @@ bot.start((ctx) => {
     parse_mode: 'MarkdownV2',
     ...Markup.inlineKeyboard([
       [Markup.button.callback('📊 View Expenses', 'VIEW_EXPENSES')],
-      [Markup.button.callback('🛠 Edit Expense', 'EDIT_EXPENSE')],
-      [Markup.button.callback('❌ Delete Last Expense', 'DELETE_LAST')],
+      [Markup.button.callback('❓ Help', 'SHOW_HELP')]
     ]),
   });
 });
@@ -578,7 +818,7 @@ function escapeMarkdownV2(text) {
     .replace(/[_*[\]()~`>#+=|{}.!-]/g, '\\$&');
 }
 
-// Add this helper function
+// Update the clearSession function to include userId
 async function clearSession(ctx) {
   if (ctx.session) {
     delete ctx.session.editingExpenseId;
@@ -586,6 +826,11 @@ async function clearSession(ctx) {
     delete ctx.session.originalAmount;
     delete ctx.session.originalCategory;
     delete ctx.session.pendingExpense;
+    delete ctx.session.userId;
+    
+    // Force session save after clearing
+    await localSession.saveSession(ctx.session);
+    console.log(`Cleared session for user ${ctx.from?.id || 'unknown'}`);
   }
 }
 
@@ -600,10 +845,9 @@ const POSITIVE_RESPONSES = ['great', 'good', 'nice', 'thanks', 'thank', 'awesome
 const GREETINGS = ['hey', 'hello', 'hi', 'hola', 'help', 'start'];
 
 // Initialize OpenAI
-const configuration = new Configuration({
+const openai = new OpenAI({
     apiKey: process.env.OPENAI_API_KEY
 });
-const openai = new OpenAIApi(configuration);
 
 // Update the learnNewCategory function to use the correct OpenAI client
 async function learnNewCategory(description, userCategory) {
@@ -612,7 +856,7 @@ async function learnNewCategory(description, userCategory) {
         const message = `Learn this expense categorization: "${description}" should be categorized as "${userCategory}". 
                         Please update your categorization knowledge accordingly.`;
         
-        const completion = await openai.createChatCompletion({
+        const completion = await openai.chat.completions.create({
             model: "gpt-3.5-turbo",
             messages: [
                 { role: "system", content: "You are a helpful expense categorizer. Learn from user corrections to improve future categorizations." },
@@ -630,34 +874,36 @@ async function learnNewCategory(description, userCategory) {
 async function showRecurringExpenses(ctx) {
     try {
         // First check if the table exists
-        db.prepare(`
+        db.run(`
             CREATE TABLE IF NOT EXISTS recurring_expenses (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 user_id TEXT,
                 amount REAL,
                 category TEXT,
+                subcategory TEXT,
                 description TEXT,
                 frequency TEXT,
                 start_date TEXT,
                 last_tracked TEXT,
                 active INTEGER DEFAULT 1
             )
-        `).run();
+        `);
 
         // Log the user ID we're searching for
         const userId = ctx.from.id.toString();
         console.log('Searching for recurring expenses for user:', userId);
 
         // Check if we have any records at all
-        const allRecords = db.prepare('SELECT COUNT(*) as count FROM recurring_expenses').get();
+        const allRecords = db.get(`SELECT COUNT(*) as count FROM recurring_expenses`);
         console.log('Total records in table:', allRecords.count);
 
         // Then fetch the expenses with explicit column names
-        const recurring = db.prepare(`
+        const recurring = db.all(`
             SELECT 
                 id,
                 amount,
                 category,
+                subcategory,
                 description,
                 frequency,
                 start_date,
@@ -666,7 +912,7 @@ async function showRecurringExpenses(ctx) {
             FROM recurring_expenses 
             WHERE user_id = ? 
             AND active = 1
-        `).all(userId);
+        `, userId);
 
         console.log('Found recurring expenses:', recurring);
 
@@ -699,7 +945,8 @@ async function showRecurringExpenses(ctx) {
         if (grouped.daily) {
             message += "📅 Daily:\n";
             grouped.daily.forEach(exp => {
-                message += `• $${parseFloat(exp.amount).toFixed(2)} - ${exp.description} (${exp.category}) 💰\n`;
+                message += `• $${parseFloat(exp.amount).toFixed(2)} - ${exp.description}\n`;
+                message += `  📂 ${exp.category || 'Uncategorized'} - 🏷️ ${exp.subcategory || 'Other'}\n`;
             });
             message += "\n";
         }
@@ -707,7 +954,8 @@ async function showRecurringExpenses(ctx) {
         if (grouped.weekly) {
             message += "📅 Weekly:\n";
             grouped.weekly.forEach(exp => {
-                message += `• $${parseFloat(exp.amount).toFixed(2)} - ${exp.description} (${exp.category}) 💰\n`;
+                message += `• $${parseFloat(exp.amount).toFixed(2)} - ${exp.description}\n`;
+                message += `  📂 ${exp.category || 'Uncategorized'} - 🏷️ ${exp.subcategory || 'Other'}\n`;
             });
             message += "\n";
         }
@@ -715,7 +963,8 @@ async function showRecurringExpenses(ctx) {
         if (grouped.monthly) {
             message += "📅 Monthly:\n";
             grouped.monthly.forEach(exp => {
-                message += `• $${parseFloat(exp.amount).toFixed(2)} - ${exp.description} (${exp.category}) 💰\n`;
+                message += `• $${parseFloat(exp.amount).toFixed(2)} - ${exp.description}\n`;
+                message += `  📂 ${exp.category || 'Uncategorized'} - 🏷️ ${exp.subcategory || 'Other'}\n`;
             });
             message += "\n";
         }
@@ -781,319 +1030,319 @@ async function showRecurringExpenses(ctx) {
     }
 }
 
+// Helper function to extract amount and description from text
+async function parseExpenseMessage(text) {
+  try {
+    // First try to find any number in the text
+    const numberMatch = text.match(/\d+(?:\.\d{1,2})?/);
+    if (!numberMatch) return null;
+
+    const amount = parseFloat(numberMatch[0]);
+    if (isNaN(amount)) return null;
+
+    // Remove the amount from the text to get the description
+    let description = text.replace(numberMatch[0], '').trim()
+      .replace(/^(on|in|for)\s+/i, '') // Remove common prepositions at start
+      .replace(/\s+(on|in|for)\s+/i, ' ') // Remove prepositions in middle
+      .trim();
+
+    if (!description) return null;
+
+    try {
+      // Try to use GPT to clean up the description
+      const response = await openai.chat.completions.create({
+        model: "gpt-3.5-turbo",
+        messages: [{
+          role: "system",
+          content: "You are a helpful expense parser. Given text about an expense, extract the amount and description. Respond ONLY with a JSON object containing 'amount' and 'description'. Clean up and standardize the description."
+        }, {
+          role: "user",
+          content: `Parse this expense: ${text}`
+        }],
+        temperature: 0.3,
+        max_tokens: 100
+      });
+
+      try {
+        const gptResult = JSON.parse(response.choices[0].message.content);
+        description = gptResult.description || description;
+      } catch (e) {
+        // If GPT parsing fails, continue with our original description
+        console.log('GPT parsing failed, using original description');
+      }
+                    } catch (error) {
+      // If OpenAI call fails, just continue with our original parsing
+      console.log('OpenAI call failed, using original description');
+    }
+
+    // Return the parsed expense
+    return { amount, description };
+                    } catch (error) {
+    console.error('Error parsing expense message:', error);
+    return null;
+  }
+}
+
+// Add a helper function for greetings and casual conversation
+function isConversational(text) {
+    const conversationalPhrases = [
+        // Greetings
+        'hey', 'hello', 'hi', 'hola', 'help', 'start',
+        // How are you variations
+        'how are you', 'how r u', 'how you doing', "what's up", 'whats up', 'sup',
+        // Questions about the bot
+        'what are you doing', 'what do you do', 'who are you', 'what is this',
+        // General conversation
+        'thanks', 'thank you', 'good morning', 'good afternoon', 'good evening',
+        'nice to meet you', 'pleasure'
+    ];
+
+    text = text.toLowerCase().trim();
+    return conversationalPhrases.some(phrase => 
+        text.includes(phrase) || 
+        text === phrase || 
+        text.startsWith(phrase + ' ') ||
+        text.endsWith(' ' + phrase)
+    );
+}
+
+// Add this function to generate appropriate system prompts
+function getSystemPrompt(text) {
+    text = text.toLowerCase().trim();
+    
+    // How are you variations
+    if (text.includes('how are you') || text.includes('how r u') || text.includes("what's up")) {
+        return `You are Hornerito. Reply with ONE of these ONLY:
+            'Hey! Doing great, just counting numbers. 👋 Ready to track expenses? 💰'
+            'All good here! Just helping people save money. 🤖 Want to track an expense? 💰'
+            'Fantastic! Been helping people track their spending. 📊 Want to try? 💰'
+            'Doing great! Ready to help you manage your money. ✨ Got an expense to track? 💰'`;
+    }
+    
+    // What do you do variations
+    if (text.includes('what are you doing') || text.includes('what do you do') || text.includes('who are you')) {
+        return `You are Hornerito. Reply with ONE of these ONLY:
+            'I help track expenses! 🤖 Try me with: 30 food 💰'
+            'I'm your personal expense tracker! ✨ Try: 25 taxi 💰'
+            'I keep track of your spending! 📊 Example: 50 groceries 💰'
+            'I'm here to help you manage money! 🎯 Try: 40 coffee 💰'`;
+    }
+    
+    // General greetings
+    if (text.match(/^(hi|hey|hello|hola)(\s|$)/)) {
+        return `You are Hornerito. Reply with ONE of these ONLY:
+            'Hi there! 👋 Ready to track some expenses? 💰'
+            'Hey! Need help tracking your spending? ✨'
+            'Hello! Let's manage your expenses together! 📊'
+            'Hi! I can help you track your money! 🎯'`;
+    }
+    
+    // Thank you variations
+    if (text.includes('thank') || text.includes('thanks')) {
+        return `You are Hornerito. Reply with ONE of these ONLY:
+            'You're welcome! 🌟 Remember, I'm here to help track expenses! 💰'
+            'Anytime! 👋 Keep those expenses coming! 📊'
+            'Happy to help! ✨ Got more expenses to track? 💰'
+            'My pleasure! 🤖 Ready for your next expense! 💰'`;
+    }
+    
+    // Default conversational prompt
+    return `You are Hornerito. Reply with ONE of these ONLY:
+        'Hi! 👋 Send me an expense like: 30 food 💰'
+        'Hello! Ready to track expenses? Try: 25 taxi 💰'
+        'Hey there! Want to track spending? Example: 40 coffee 💰'
+        'Greetings! Let's track expenses! Try: 50 groceries 💰'`;
+}
+
 // Update the text handler
 bot.on('text', async (ctx) => {
     try {
-        const text = ctx.message.text.toLowerCase().trim();
+        const text = ctx.message.text.trim();
+        const userId = ctx.from.id.toString();
+
         console.log('Received text:', text);
+        console.log('Current session state:', JSON.stringify(ctx.session, null, 2));
 
-        // First, check for recurring expense list request
-        if (['show recurring', 'list recurring', 'recurring expenses', 'show recurring expenses', 'show my recurring expenses'].includes(text)) {
-            await showRecurringExpenses(ctx);
-            return;
-        }
-
-        // Then check for recurring expense setup request
-        if (text === 'add recurring expense' || text === 'recurring expense') {
-            ctx.session = {
-                ...ctx.session,
-                addingRecurring: true,
-                recurringStep: 'amount'
-            };
+        // Check if we're in the middle of editing an amount
+        if (ctx.session?.editingExpenseId) {
+            console.log(`Processing amount edit for expense ${ctx.session.editingExpenseId}`);
             
-            await ctx.reply(
-                "🎯 Awesome! Let's set up a recurring expense together!\n\n" +
-                "💰 First, what's the amount you want to track?\n" +
-                "Just send me a number (like 25.99) 👇",
-                {
-                    reply_markup: {
-                        inline_keyboard: [
-                            [{ text: "❌ Cancel", callback_data: "CANCEL_RECURRING" }]
-                        ]
-                    }
-                }
-            );
-            return;
-        }
+            const amount = parseFloat(text);
+            if (isNaN(amount)) {
+                await ctx.reply(
+                    "❌ Please send a valid number\\.",
+                    { parse_mode: 'MarkdownV2' }
+                );
+                return;
+            }
 
-        // If we're in a recurring expense setup flow
-        if (ctx.session?.addingRecurring) {
-            switch (ctx.session.recurringStep) {
-                case 'amount':
-                    const amount = parseFloat(text);
-                    if (isNaN(amount) || amount <= 0) {
-                        await ctx.reply(
-                            "❌ Oops! That doesn't look like a valid amount.\n\n" +
-                            "🔢 Please send me a number like 25.99 or 100\n" +
-                            "Let's try again! 😊"
-                        );
+            // Update the expense amount with user_id check
+            db.run(
+                `UPDATE expenses SET amount = ? WHERE id = ? AND user_id = ?`,
+                [amount, ctx.session.editingExpenseId, userId],
+                async function(err) {
+                    if (err) {
+                        console.error('Error updating amount:', err);
+                        await ctx.reply("❌ Error updating amount\\. Please try again\\.", { parse_mode: 'MarkdownV2' });
                         return;
                     }
-                    ctx.session.recurringAmount = amount;
-                    ctx.session.recurringStep = 'description';
-                    await ctx.reply(
-                        "🌟 Perfect! Now, what is this expense for?\n\n" +
-                        "💡 Examples:\n" +
-                        "• Netflix subscription 📺\n" +
-                        "• Gym membership 🏋️‍♂️\n" +
-                        "• Monthly bus pass 🚌\n" +
-                        "• Phone bill 📱",
-                        {
-                            reply_markup: {
-                                inline_keyboard: [
-                                    [{ text: "❌ Cancel", callback_data: "CANCEL_RECURRING" }]
-                                ]
-                            }
-                        }
-                    );
-                    return;
 
-                case 'description':
-                    ctx.session.recurringDescription = text;
+                    if (this.changes === 0) {
+                        console.log(`No expense updated for ID ${ctx.session.editingExpenseId} and user ${userId}`);
+                        await ctx.reply("❌ Failed to update amount\\.", { parse_mode: 'MarkdownV2' });
+                        return;
+                    }
+
+                    console.log(`Successfully updated amount for expense ${ctx.session.editingExpenseId}`);
                     
-                    try {
-                        console.log('🔍 Categorizing recurring expense:', text);
-                        const category = await categorizer.categorize(text);
-                        console.log('✅ Category determined:', category);
-                        
-                        ctx.session.recurringCategory = category;
-                        
-                        await ctx.reply(
-                            `🤔 I think "${text}" belongs in the "${category}" category!\n\n` +
-                            "✨ Did I get that right?",
-                            {
-                                reply_markup: {
-                                    inline_keyboard: [
-                                        [
-                                            { text: "✅ Yes, perfect!", callback_data: "CAT_CONFIRM" },
-                                            { text: "✏️ Need to change it", callback_data: "CAT_CHANGE" }
-                                        ],
-                                        [
-                                            { text: "🔄 Start over", callback_data: "CAT_RESTART" },
-                                            { text: "❌ Cancel", callback_data: "CANCEL_RECURRING" }
-                                        ]
-                                    ]
-                                }
-                            }
-                        );
-                    } catch (error) {
-                        console.error('Error categorizing expense:', error);
-                        await ctx.reply(
-                            "😅 Oops! I had a bit of trouble categorizing that.\n\n" +
-                            "🔄 Could you try describing it again?",
-                            {
-                                reply_markup: {
-                                    inline_keyboard: [
-                                        [{ text: "❌ Cancel", callback_data: "CANCEL_RECURRING" }]
-                                    ]
-                                }
-                            }
-                        );
-                    }
-                    return;
+                    const escapedAmount = amount.toString().replace(/[.\-]/g, '\\$&');
+                    const escapedCategory = escapeMarkdownV2(ctx.session.originalCategory || 'Uncategorized');
 
-                case 'manual_category':
-                    const userCategory = text;
-                    const description = ctx.session.recurringDescription;
-
-                    await learnNewCategory(description, userCategory);
-                    ctx.session.recurringCategory = userCategory;
-
-                    try {
-                        const suggestedCategory = await categorizer.categorize(description, userCategory);
-                        
-                        if (suggestedCategory.toLowerCase() !== userCategory.toLowerCase()) {
-                            await ctx.reply(
-                                "🤔 I have two options for categorizing this:\n\n" +
-                                `1️⃣ Your suggestion: "${userCategory}"\n` +
-                                `2️⃣ My suggestion: "${suggestedCategory}"\n\n` +
-                                "✨ Which one should we use?",
-                                {
-                                    reply_markup: {
-                                        inline_keyboard: [
-                                            [
-                                                { text: "1️⃣ Use mine", callback_data: `USE_CAT_${userCategory}` },
-                                                { text: "2️⃣ Use suggestion", callback_data: `USE_CAT_${suggestedCategory}` }
-                                            ],
-                                            [{ text: "❌ Cancel", callback_data: "CANCEL_RECURRING" }]
-                                        ]
-                                    }
-                                }
-                            );
-                            return;
-                        }
-                    } catch (error) {
-                        console.error('Error in category validation:', error);
-                    }
-
-                    ctx.session.recurringStep = 'frequency';
                     await ctx.reply(
-                        `🎯 Great! Category set to "${userCategory}"\n\n` +
-                        "⏰ How often should I track this expense?",
+                        `✅ Amount updated: \$${escapedAmount} on ${escapedCategory}`,
                         {
+                            parse_mode: 'MarkdownV2',
                             reply_markup: {
                                 inline_keyboard: [
                                     [
-                                        { text: "📅 Daily", callback_data: "FREQ_daily" },
-                                        { text: "📅 Weekly", callback_data: "FREQ_weekly" },
-                                        { text: "📅 Monthly", callback_data: "FREQ_monthly" }
+                                        Markup.button.callback('🗑️ Delete', `DELETE_${ctx.session.editingExpenseId}`),
+                                        Markup.button.callback('📊 View Last 5', 'VIEW_EXPENSES')
                                     ],
-                                    [{ text: "❌ Cancel", callback_data: "CANCEL_RECURRING" }]
+                                    [
+                                        Markup.button.callback('❓ Help', 'SHOW_HELP')
+                                    ]
                                 ]
                             }
                         }
                     );
-                    return;
-            }
-        }
 
-        // Finally, handle regular expense logging
-        // If we're editing an amount, handle it differently
-        if (ctx.session?.editingExpenseId) {
-            const amount = parseFloat(text);
-            
-            if (isNaN(amount)) {
-                await ctx.reply(
-                    "❌ Please send a valid number for the amount\\.",
-                    { parse_mode: 'MarkdownV2' }
-                );
-                return;
-            }
-
-            try {
-                const expenseId = ctx.session.editingExpenseId;
-                const originalCategory = ctx.session.originalCategory;
-
-                // Update the expense with new amount
-                db.prepare('UPDATE expenses SET amount = ? WHERE id = ?')
-                    .run(amount, expenseId);
-
-                // Clear the editing session
-                delete ctx.session.editingExpenseId;
-                delete ctx.session.originalCategory;
-
-                const escapedAmount = amount.toString().replace(/[.\-]/g, '\\$&');
-                const escapedCategory = escapeMarkdownV2(originalCategory);
-
-                await ctx.reply(
-                    `✅ Amount updated: \$${escapedAmount} on ${escapedCategory}`,
-                    {
-                        parse_mode: 'MarkdownV2',
-                        reply_markup: {
-                            inline_keyboard: [
-                                [
-                                    Markup.button.callback('✏️ Edit Amount', `EDIT_${expenseId}`),
-                                    Markup.button.callback('🏷️ Edit Category', `EDITCAT_${expenseId}`)
-                                ],
-                                [
-                                    Markup.button.callback('🗑️ Delete', `DELETE_${expenseId}`),
-                                    Markup.button.callback('📊 View Last 5', 'VIEW_EXPENSES')
-                                ],
-                                [
-                                    Markup.button.callback('❌ Cancel', 'CANCEL')
-                                ]
-                            ]
-                        }
-                    }
-                );
-                return;
-            } catch (error) {
-                console.error('Error updating amount:', error);
-                await ctx.reply(
-                    "❌ Error updating amount\\. Please try again\\.",
-                    { parse_mode: 'MarkdownV2' }
-                );
-                return;
-            }
-        }
-
-        // Handle positive responses
-        if (POSITIVE_RESPONSES.some(word => text.includes(word))) {
-            await ctx.reply(
-                "😊 Glad I could help!\n\n" +
-                "If you have any expense to record, just let me know! You can use:\n" +
-                "• '30 on food'\n" +
-                "• '25 taxi'\n" +
-                "• '10 coffee' (simple format works too!)",
-                {
-                    reply_markup: {
-                        inline_keyboard: [
-                            [
-                                Markup.button.callback('📊 View Last 5', 'VIEW_EXPENSES')
-                            ],
-                            [
-                                Markup.button.url('🌐 View Dashboard', DASHBOARD_URL)
-                            ]
-                        ]
-                    }
+                    // Clear the editing session
+                    ctx.session = {
+                        editingExpenseId: null,
+                        originalCategory: null,
+                        originalAmount: null,
+                        userId: null
+                    };
                 }
             );
             return;
         }
 
-        // Handle greetings
-        if (GREETINGS.some(word => text.includes(word))) {
-            const welcomeMsg = 
-                "👋 Welcome to Hornerito\\! I can help you track your expenses\\.\n\n" +
-                "💡 *How to use me:*\n" +
-                "• Send amount and category \\(e\\.g\\. '30 on food'\\)\n" +
-                "• View your expenses with the buttons below\n" +
-                "• Edit or delete expenses as needed";
-
-            await ctx.reply(welcomeMsg, {
-                parse_mode: 'MarkdownV2',
-                reply_markup: {
-                    inline_keyboard: [
-                        [
-                            Markup.button.callback('📊 View Last 5', 'VIEW_EXPENSES')
-                        ],
-                        [
-                            Markup.button.url('🌐 View Dashboard', DASHBOARD_URL)
-                        ]
-                    ]
-                }
-            });
-            return;
-        }
-
-        // Handle expense pattern
-        const regex = /([0-9]+(?:\.[0-9]+)?)\s*(?:on|in|for)?\s*(.+)/i;
-        const match = text.match(regex);
-
-        if (match) {
+        // Check if it's a conversational message
+        if (isConversational(text)) {
             try {
-                const amount = parseFloat(match[1]);
-                const expenseText = match[2].trim();
-                console.log('🔍 Categorizing:', JSON.stringify(expenseText));
-                const category = await categorizer.categorize(expenseText);
-                console.log('✅ Found category:', category);
+                const completion = await openai.chat.completions.create({
+                    model: "gpt-3.5-turbo",
+                    messages: [
+                        {
+                            role: "system",
+                            content: getSystemPrompt(text)
+                        },
+                        {
+                            role: "user",
+                            content: text
+                        }
+                    ],
+                    max_tokens: 50,
+                    temperature: 0.3
+                });
 
-                const timestamp = new Date().toISOString();
-                const result = db.prepare(
-                    'INSERT INTO expenses (user_id, amount, category, timestamp) VALUES (?, ?, ?, ?)'
-                ).run(ctx.from.id.toString(), amount, category, timestamp);
-
-                const escapedAmount = amount.toString().replace(/[.\-]/g, '\\$&');
-                const escapedCategory = escapeMarkdownV2(category);
-
-                await ctx.reply(`✅ Expense saved: \$${escapedAmount} on ${escapedCategory}`, {
-                    parse_mode: 'MarkdownV2',
+                const response = completion.choices[0].message.content;
+                
+                await ctx.reply(response, {
                     reply_markup: {
                         inline_keyboard: [
                             [
-                                Markup.button.callback('✏️ Edit Amount', `EDIT_${result.lastInsertRowid}`),
-                                Markup.button.callback('🏷️ Edit Category', `EDITCAT_${result.lastInsertRowid}`)
-                            ],
-                            [
-                                Markup.button.callback('🗑️ Delete', `DELETE_${result.lastInsertRowid}`),
-                                Markup.button.callback('📊 View Last 5', 'VIEW_EXPENSES')
-                            ],
-                            [
-                                Markup.button.url('🌐 View Dashboard', DASHBOARD_URL)
+                                Markup.button.callback('📊 View Expenses', 'VIEW_EXPENSES'),
+                                Markup.button.callback('❓ Help', 'SHOW_HELP')
                             ]
                         ]
                     }
                 });
+                return;
+            } catch (error) {
+                console.error('Error generating AI response:', error);
+                // Fallback response if AI fails
+                await ctx.reply(
+                    "Hi! 👋 Try: '30 food' or '25 taxi' 💰",
+                    {
+                        reply_markup: {
+                            inline_keyboard: [
+                                [
+                                    Markup.button.callback('📊 View Expenses', 'VIEW_EXPENSES'),
+                                    Markup.button.callback('❓ Help', 'SHOW_HELP')
+                                ]
+                            ]
+                        }
+                    }
+                );
+                return;
+            }
+        }
+
+        // Try to parse the expense message
+        const parsedExpense = await parseExpenseMessage(text);
+        
+        if (parsedExpense) {
+            try {
+                const { amount, description } = parsedExpense;
+                
+                // Capitalize the first letter of each word in the description
+                const expenseDescription = description
+                    .split(' ')
+                    .map(word => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
+                    .join(' ');
+
+                console.log('🔍 Categorizing:', description);
+                
+                // Use the categorizeExpense function (now async)
+                const { category, subcategory } = await categorizeExpense(description);
+                console.log('✅ Categorized as:', { category, subcategory });
+
+                if (!category) {
+                    throw new Error('Could not determine category');
+                }
+
+                const timestamp = new Date().toISOString();
+                const result = db.run(
+                    `INSERT INTO expenses (user_id, amount, category, subcategory, description, timestamp) 
+                     VALUES (?, ?, ?, ?, ?, ?)`,
+                    ctx.from.id.toString(),
+                    amount,
+                    category,
+                    subcategory || 'Other',
+                    expenseDescription,
+                    timestamp
+                );
+
+                const escapedAmount = amount.toString().replace(/[.\-]/g, '\\$&');
+                const escapedCategory = escapeMarkdownV2(category);
+                const escapedSubcategory = escapeMarkdownV2(subcategory || 'Other');
+                const escapedDescription = escapeMarkdownV2(expenseDescription);
+
+                await ctx.reply(
+                    `✅ Expense saved: \$${escapedAmount}\n` +
+                    `📝 Description: ${escapedDescription}\n` +
+                    `📂 Category: ${escapedCategory}\n` +
+                    `🏷️ Subcategory: ${escapedSubcategory}`,
+                    {
+                    parse_mode: 'MarkdownV2',
+                    reply_markup: {
+                        inline_keyboard: [
+                            [
+                                Markup.button.callback('🗑️ Delete', `DELETE_${result.lastID}`),
+                                Markup.button.callback('📊 View Last 5', 'VIEW_EXPENSES')
+                            ],
+                            [
+                                Markup.button.callback('❓ Help', 'SHOW_HELP')
+                            ],
+                            [
+                                Markup.button.url('🌐 View Dashboard', DASHBOARD_URL)
+                            ]
+                        ]
+                    }
+                    }
+                );
             } catch (error) {
                 console.error('Error saving expense:', error);
                 await ctx.reply(
@@ -1102,29 +1351,44 @@ bot.on('text', async (ctx) => {
                 );
             }
         } else {
-            await ctx.reply(
-                "I'm not sure what you mean\\. Try:\n" +
-                "• '30 on food'\n" +
-                "• '25 taxi' \\(simple format works too\\!\\)\n" +
-                "• Or just say 'help' for more info", 
-                { 
-                    parse_mode: 'MarkdownV2',
+            // If not a greeting and not an expense, try to understand with AI
+            try {
+                const completion = await openai.chat.completions.create({
+                    model: "gpt-3.5-turbo",
+                    messages: [
+                        {
+                            role: "system",
+                            content: "You are Hornerito. Reply with ONLY: 'Hi! 👋 Send me an expense like: 30 food 💰'"
+                        },
+                        {
+                            role: "user",
+                            content: text
+                        }
+                    ],
+                    max_tokens: 50,
+                    temperature: 0.3
+                });
+
+                await ctx.reply(completion.choices[0].message.content, {
                     reply_markup: {
                         inline_keyboard: [
-                            [
-                                Markup.button.callback('📊 View Last 5', 'VIEW_EXPENSES')
-                            ]
+                            [Markup.button.callback('📊 View Expenses', 'VIEW_EXPENSES')]
                         ]
                     }
+                });
+            } catch (error) {
+                console.error('Error generating AI response:', error);
+                // Only show help if it seems like they were trying to track an expense
+                if (text.match(/\d+/) || text.toLowerCase().includes('spent')) {
+                    await ctx.reply(
+                        "Try: `30 food`, `25 taxi`, `100 groceries` 💰",
+                        { parse_mode: 'MarkdownV2' }
+                    );
                 }
-            );
+            }
         }
     } catch (error) {
         console.error('Error in text handler:', error);
-        await ctx.reply(
-            "😅 Oops! Something went wrong.\n" +
-            "Please try again in a moment! 🔄"
-        );
     }
 });
 
@@ -1132,10 +1396,24 @@ bot.on('text', async (ctx) => {
 bot.action('CANCEL', async (ctx) => {
     try {
         await ctx.answerCbQuery();
-        await clearSession(ctx);
-        await ctx.reply('❌ Operation cancelled');
+        
+        // Check if session exists
+        if (!ctx.session) {
+            ctx.session = {};
+        }
+        
+        // Clear the editing session
+        delete ctx.session.editingExpenseId;
+        delete ctx.session.userId;
+        
+        // Force session save
+        await localSession.saveSession(ctx.session);
+        console.log('Session cleared after cancel:', ctx.session);
+        
+        await ctx.reply("✅ Operation cancelled.");
     } catch (error) {
-        console.error('Error in cancel handler:', error);
+        console.error('Error in CANCEL handler:', error);
+        await ctx.reply("❌ Error cancelling operation. Please try again.");
     }
 });
 
@@ -1144,43 +1422,158 @@ function addPermanentButtons(keyboard = []) {
     const permanentButtons = [
         [
             { text: '📊 View Expenses', callback_data: 'VIEW_EXPENSES' },
+            { text: '❓ Help', callback_data: 'SHOW_HELP' }
+        ],
+        [
             { text: '❌ Cancel', callback_data: 'CANCEL' }
         ]
     ];
     return [...keyboard, ...permanentButtons];
 }
 
-// Edit expense handler
+// Edit expense handler with improved session handling and logging
 bot.action(/^EDIT_(\d+)$/, async (ctx) => {
-    const expenseId = ctx.match[1];
-    
-    const expense = db.prepare('SELECT * FROM expenses WHERE id = ?').get(expenseId);
-    
-    if (!expense) {
-        await ctx.reply("❌ Expense not found\\.", { parse_mode: 'MarkdownV2' });
-        return;
-    }
+    try {
+        await ctx.answerCbQuery();
+        const expenseId = ctx.match[1];
+        const userId = ctx.from.id.toString();
+        
+        console.log(`\n📝 Starting edit process for expense ${expenseId} by user ${userId}`);
 
-    ctx.session = {
-        editingExpenseId: parseInt(expenseId),
-        originalCategory: expense.category
-    };
+        // Get the expense with user_id check
+        db.get(
+            `SELECT * FROM expenses WHERE id = ? AND user_id = ?`, 
+            [expenseId, userId], 
+            async (err, expense) => {
+                if (err) {
+                    console.error('Error fetching expense:', err);
+                    await ctx.reply("❌ Error editing expense\\. Please try again\\.", { parse_mode: 'MarkdownV2' });
+                    return;
+                }
 
-    const escapedAmount = expense.amount.toString().replace(/[.\-]/g, '\\$&');
-    const escapedCategory = escapeMarkdownV2(expense.category);
+                if (!expense) {
+                    console.log(`Expense ${expenseId} not found for user ${userId}`);
+                    await ctx.reply("❌ Expense not found\\.", { parse_mode: 'MarkdownV2' });
+                    return;
+                }
 
-    await ctx.reply(
-        `✏️ Current expense: \$${escapedAmount} on ${escapedCategory}\n\n` +
-        `Send the new amount:`,
-        {
-            parse_mode: 'MarkdownV2',
-            reply_markup: {
-                inline_keyboard: [
-                    [Markup.button.callback('❌ Cancel', 'CANCEL')]
-                ]
+                console.log('Found expense:', expense);
+
+                // Update session state
+                ctx.session.editingExpenseId = parseInt(expenseId);
+                ctx.session.originalCategory = expense.category;
+                ctx.session.originalAmount = expense.amount;
+                ctx.session.userId = userId;
+
+                // Force session to save
+                await ctx.session.save();
+
+                console.log('Updated session state:', ctx.session);
+
+                const escapedAmount = expense.amount.toString().replace(/[.\-]/g, '\\$&');
+                const escapedCategory = escapeMarkdownV2(expense.category || 'Uncategorized');
+
+                await ctx.reply(
+                    `✏️ Current expense: \$${escapedAmount} on ${escapedCategory}\n\n` +
+                    `Send the new amount:`,
+                    {
+                        parse_mode: 'MarkdownV2',
+                        reply_markup: {
+                            inline_keyboard: [
+                                [Markup.button.callback('❌ Cancel', 'CANCEL')]
+                            ]
+                        }
+                    }
+                );
+                console.log('Edit amount prompt sent successfully');
             }
+        );
+    } catch (error) {
+        console.error('Error in EDIT handler:', error);
+        ctx.session.editingExpenseId = null;
+        ctx.session.originalCategory = null;
+        ctx.session.originalAmount = null;
+        ctx.session.userId = null;
+        await ctx.session.save();
+        await ctx.reply("❌ Error editing expense\\. Please try again\\.", { parse_mode: 'MarkdownV2' });
+    }
+});
+
+// Update the text handler to handle editing amounts properly
+bot.on('text', async (ctx) => {
+    try {
+        const text = ctx.message.text.trim();
+        const userId = ctx.from.id.toString();
+
+        console.log('\n📩 Received text message:', text);
+        console.log('Current session state:', JSON.stringify(ctx.session, null, 2));
+
+        // Check if we're in the middle of editing an amount
+        if (ctx.session?.editingExpenseId && ctx.session.userId === userId) {
+            console.log('Processing amount edit for expense', ctx.session.editingExpenseId);
+            
+            const amount = parseFloat(text);
+            if (isNaN(amount)) {
+                await ctx.reply(
+                    "❌ Please send a valid number\\.",
+                    { parse_mode: 'MarkdownV2' }
+                );
+                return;
+            }
+
+            const escapedAmount = amount.toString().replace(/[.\-]/g, '\\$&');
+            const escapedCategory = escapeMarkdownV2(ctx.session.originalCategory || 'Uncategorized');
+
+            // Update the expense in the database
+            db.run(
+                `UPDATE expenses SET amount = ? WHERE id = ? AND user_id = ?`,
+                [amount, ctx.session.editingExpenseId, userId],
+                async (err) => {
+                    if (err) {
+                        console.error('Error updating expense:', err);
+                        await ctx.reply("❌ Error updating expense\\. Please try again\\.", { parse_mode: 'MarkdownV2' });
+                        return;
+                    }
+
+                    await ctx.reply(
+                        `✅ Amount updated: \$${escapedAmount} on ${escapedCategory}`,
+                        {
+                            parse_mode: 'MarkdownV2',
+                            reply_markup: {
+                                inline_keyboard: [
+                                    [
+                                        Markup.button.callback('🗑️ Delete', `DELETE_${ctx.session.editingExpenseId}`),
+                                        Markup.button.callback('📊 View Last 5', 'VIEW_EXPENSES')
+                                    ],
+                                    [
+                                        Markup.button.callback('❓ Help', 'SHOW_HELP')
+                                    ]
+                                ]
+                            }
+                        }
+                    );
+
+                    // Clear the editing session
+                    ctx.session.editingExpenseId = null;
+                    ctx.session.originalCategory = null;
+                    ctx.session.originalAmount = null;
+                    ctx.session.userId = null;
+                    await ctx.session.save();
+                }
+            );
+            return;
         }
-    );
+
+        // Handle regular expense messages
+        // ... existing code ...
+    } catch (error) {
+        console.error('Error in text handler:', error);
+        ctx.session.editingExpenseId = null;
+        ctx.session.originalCategory = null;
+        ctx.session.originalAmount = null;
+        ctx.session.userId = null;
+        await ctx.session.save();
+    }
 });
 
 // Handle "Other" category selection
@@ -1219,43 +1612,64 @@ bot.action('cat_other', async (ctx) => {
 // Update the EDITCAT handler
 bot.action(/^EDITCAT_(\d+)$/, async (ctx) => {
     try {
+        // Answer callback query immediately
         await ctx.answerCbQuery();
+        
+        // Get expense ID from the callback data
         const expenseId = ctx.match[1];
-        
-        const expense = db.prepare('SELECT * FROM expenses WHERE id = ?').get(expenseId);
-        
+        const userId = ctx.from.id.toString();
+
+        console.log(`EDITCAT handler called for expense ${expenseId} by user ${userId}`);
+
+        // First verify that this expense belongs to the user
+        const expense = await new Promise((resolve, reject) => {
+            db.get(
+                'SELECT * FROM expenses WHERE id = ? AND user_id = ?',
+                [expenseId, userId],
+                (err, row) => {
+                    if (err) reject(err);
+                    else resolve(row);
+                }
+            );
+        });
+
         if (!expense) {
-            await ctx.reply("❌ Expense not found\\.", { parse_mode: 'MarkdownV2' });
+            await ctx.reply("❌ Expense not found or unauthorized.");
             return;
         }
-
-        // Store the expense ID and amount in session
-        ctx.session = {
-            editingCategoryId: parseInt(expenseId),
-            originalAmount: expense.amount
-        };
-
-        const escapedAmount = expense.amount.toString().replace(/[.\-]/g, '\\$&');
-        const escapedCategory = escapeMarkdownV2(expense.category || 'uncategorized');
-
+        
+        // Initialize session if it doesn't exist
+        if (!ctx.session) {
+            ctx.session = {};
+        }
+        
+        // Store the expense ID and user ID in session
+        ctx.session.editingExpenseId = expenseId;
+        ctx.session.userId = userId;
+        
+        // Force session save
+        await localSession.saveSession(ctx.session);
+        
+        // Log the updated session state
+        console.log(`Updated session state for user ${userId}:`, JSON.stringify(ctx.session, null, 2));
+        
+        // Send category selection menu
         await ctx.reply(
-            `Current expense: \$${escapedAmount} on ${escapedCategory}\n\n` +
-            `Select new category:`,
+            "Select a category:",
             {
-                parse_mode: 'MarkdownV2',
                 reply_markup: {
                     inline_keyboard: [
                         [
-                            { text: "🍽️ Food & Drinks", callback_data: "cat_food" },
-                            { text: "🚗 Transport", callback_data: "cat_transport" }
+                            { text: "🍽️ Food & Drinks", callback_data: `cat_food` },
+                            { text: "🚗 Transport", callback_data: `cat_transport` }
                         ],
                         [
-                            { text: "🛍️ Shopping", callback_data: "cat_shopping" },
-                            { text: "🎮 Entertainment", callback_data: "cat_entertainment" }
+                            { text: "🛍️ Shopping", callback_data: `cat_shopping` },
+                            { text: "🎮 Entertainment", callback_data: `cat_entertainment` }
                         ],
                         [
-                            { text: "💊 Health", callback_data: "cat_health" },
-                            { text: "📦 Other", callback_data: "cat_other" }
+                            { text: "💊 Health", callback_data: `cat_health` },
+                            { text: "📦 Other", callback_data: `cat_other` }
                         ],
                         [
                             { text: "❌ Cancel", callback_data: "CANCEL" }
@@ -1266,78 +1680,88 @@ bot.action(/^EDITCAT_(\d+)$/, async (ctx) => {
         );
     } catch (error) {
         console.error('Error in EDITCAT handler:', error);
-        await ctx.reply("❌ Error editing category\\. Please try again\\.", { parse_mode: 'MarkdownV2' });
+        await ctx.reply("❌ Error editing category. Please try again.");
     }
 });
 
-// Update the category selection handler
+// Add handler for main categories
 bot.action(/^cat_(.+)$/, async (ctx) => {
     try {
         await ctx.answerCbQuery();
-        const mainCategory = ctx.match[1];
         
-        let subcategories;
-        switch (mainCategory.toLowerCase()) {
-            case 'food':
-                subcategories = [
-                    ['Meals', 'Snacks'],
-                    ['Drinks', 'Groceries']
-                ];
-                break;
-            case 'transport':
-                subcategories = [
-                    ['Taxi', 'Public'],
-                    ['Fuel', 'Parking']
-                ];
-                break;
-            case 'shopping':
-                subcategories = [
-                    ['Clothing', 'Electronics'],
-                    ['Home', 'Personal']
-                ];
-                break;
-            case 'entertainment':
-                subcategories = [
-                    ['Movies', 'Games'],
-                    ['Events', 'Sports']
-                ];
-                break;
-            case 'health':
-                subcategories = [
-                    ['Medical', 'Pharmacy'],
-                    ['Fitness', 'Personal Care']
-                ];
-                break;
-            case 'other':
-                subcategories = [
-                    ['Education', 'Business'],
-                    ['Gifts', 'Misc']
-                ];
-                break;
-            default:
-                subcategories = [['General']];
+        // Check if session exists
+        if (!ctx.session) {
+            ctx.session = {};
+            console.log('Session initialized in cat_ handler');
+        }
+        
+        // Check if editing expense ID exists in session
+        if (!ctx.session.editingExpenseId || !ctx.session.userId) {
+            console.log('No editing expense ID or user ID in session:', ctx.session);
+            await ctx.reply("❌ No expense selected for editing.");
+            return;
         }
 
-        const keyboard = subcategories.map(row => 
-            row.map(subcat => ({
-                text: subcat,
-                callback_data: `subcat_${mainCategory}_${subcat.toLowerCase()}`
-            }))
-        );
-
-        keyboard.push([{ text: "❌ Cancel", callback_data: "CANCEL" }]);
-
+        const mainCategory = ctx.match[1];
+        console.log(`Selected main category: ${mainCategory} for expense ${ctx.session.editingExpenseId}`);
+        
+        let subcategories = [];
+        
+        switch(mainCategory) {
+            case 'food':
+                subcategories = ["Groceries", "Restaurant", "Snacks", "Coffee"];
+                break;
+            case 'transport':
+                subcategories = ["Public", "Taxi", "Fuel", "Maintenance"];
+                break;
+            case 'shopping':
+                subcategories = ["Clothes", "Electronics", "Home", "Personal"];
+                break;
+            case 'entertainment':
+                subcategories = ["Movies", "Games", "Sports", "Events"];
+                break;
+            case 'health':
+                subcategories = ["Medical", "Pharmacy", "Fitness", "Wellness"];
+                break;
+            case 'other':
+                subcategories = ["Bills", "Gifts", "Education", "Misc"];
+                break;
+        }
+        
+        const keyboard = subcategories.map(subcat => ({
+            text: subcat,
+            callback_data: `subcat_${mainCategory}_${subcat.toLowerCase()}`
+        }));
+        
         await ctx.reply(
-            `Select a subcategory for ${mainCategory}:`,
+            "Select a subcategory:",
             {
-                reply_markup: { inline_keyboard: keyboard }
+                reply_markup: {
+                    inline_keyboard: [
+                        ...chunk(keyboard, 2),
+                        [{ text: "❌ Cancel", callback_data: "CANCEL" }]
+                    ]
+                }
             }
         );
+        
+        // Force session save
+        await localSession.saveSession(ctx.session);
+        console.log('Session saved in cat_ handler:', ctx.session);
     } catch (error) {
         console.error('Error in category selection:', error);
-        await ctx.reply("❌ Error selecting category\\. Please try again\\.", { parse_mode: 'MarkdownV2' });
+        await ctx.reply("❌ Error selecting category. Please try again.");
     }
 });
+
+// Helper function to chunk array into groups
+function chunk(array, size) {
+    const chunks = [];
+    for (let i = 0; i < array.length; i += size) {
+        chunks.push(array.slice(i, i + size));
+    }
+    return chunks;
+}
 
 // Update the subcategory selection handler
 bot.action(/^subcat_(.+)_(.+)$/, async (ctx) => {
@@ -1345,48 +1769,94 @@ bot.action(/^subcat_(.+)_(.+)$/, async (ctx) => {
         await ctx.answerCbQuery();
         const mainCategory = ctx.match[1];
         const subCategory = ctx.match[2];
-        const fullCategory = `${mainCategory}>${subCategory}`;
+        const fullCategory = `${mainCategory} > ${subCategory}`;
 
-        if (ctx.session?.editingCategoryId) {
-            const expenseId = ctx.session.editingCategoryId;
-            const amount = ctx.session.originalAmount;
-
-            // Update the expense with new category
-            db.prepare('UPDATE expenses SET category = ? WHERE id = ?')
-                .run(fullCategory, expenseId);
-
-            // Clear the editing session
-            delete ctx.session.editingCategoryId;
-            delete ctx.session.originalAmount;
-
-            const escapedAmount = amount.toString().replace(/[.\-]/g, '\\$&');
-            const escapedCategory = escapeMarkdownV2(fullCategory);
-
-            await ctx.reply(
-                `✅ Category updated: \$${escapedAmount} on ${escapedCategory}`,
-                {
-                    parse_mode: 'MarkdownV2',
-                    reply_markup: {
-                        inline_keyboard: [
-                            [
-                                Markup.button.callback('✏️ Edit Amount', `EDIT_${expenseId}`),
-                                Markup.button.callback('🏷️ Edit Category', `EDITCAT_${expenseId}`)
-                            ],
-                            [
-                                Markup.button.callback('🗑️ Delete', `DELETE_${expenseId}`),
-                                Markup.button.callback('📊 View Last 5', 'VIEW_EXPENSES')
-                            ],
-                            [
-                                Markup.button.url('🌐 View Dashboard', DASHBOARD_URL)
-                            ]
-                        ]
-                    }
-                }
-            );
+        // Check if session exists
+        if (!ctx.session) {
+            ctx.session = {};
+            console.log('Session initialized in subcat_ handler');
         }
+
+        console.log('Session in subcat_ handler:', ctx.session);
+
+        if (!ctx.session.editingExpenseId || !ctx.session.userId) {
+            console.log('No editing expense ID or user ID in session:', ctx.session);
+            await ctx.reply("❌ No expense selected for editing.");
+            return;
+        }
+
+        const expenseId = ctx.session.editingExpenseId;
+        const userId = ctx.session.userId;
+        
+        console.log(`Updating expense ${expenseId} for user ${userId} to category ${fullCategory}`);
+        
+        // Get the current expense to preserve the amount and verify ownership
+        db.get(
+            `SELECT amount FROM expenses WHERE id = ? AND user_id = ?`, 
+            [expenseId, userId], 
+            async (err, expense) => {
+                if (err) {
+                    console.error('Error fetching expense:', err);
+                    await ctx.reply("❌ Error updating category. Please try again.");
+                    return;
+                }
+
+                if (!expense) {
+                    console.error('Expense not found or unauthorized:', expenseId, userId);
+                    await ctx.reply("❌ Expense not found or unauthorized.");
+                    return;
+                }
+
+                console.log(`Found expense with amount ${expense.amount}`);
+
+                // Update the expense with new category
+                db.run(
+                    `UPDATE expenses SET category = ?, subcategory = ? WHERE id = ? AND user_id = ?`,
+                    [mainCategory, subCategory, expenseId, userId],
+                    async function(err) {
+                        if (err) {
+                            console.error('Error updating category:', err);
+                            await ctx.reply("❌ Error updating category. Please try again.");
+                            return;
+                        }
+
+                        if (this.changes === 0) {
+                            console.error('No rows updated:', expenseId, userId);
+                            await ctx.reply("❌ Failed to update category.");
+                            return;
+                        }
+
+                        console.log(`Successfully updated expense ${expenseId} to category ${fullCategory}`);
+
+                        // Send success message
+                        await ctx.reply(
+                            `✅ Category updated: $${expense.amount} on ${mainCategory} > ${subCategory}`,
+                            {
+                                reply_markup: {
+                                    inline_keyboard: [
+                                        [
+                                            Markup.button.callback('📊 View Last 5', 'VIEW_EXPENSES'),
+                                            Markup.button.callback('❓ Help', 'SHOW_HELP')
+                                        ]
+                                    ]
+                                }
+                            }
+                        );
+
+                        // Clear the editing session
+                        delete ctx.session.editingExpenseId;
+                        delete ctx.session.userId;
+                        
+                        // Force session save
+                        await localSession.saveSession(ctx.session);
+                        console.log('Session cleared after update:', ctx.session);
+                    }
+                );
+            }
+        );
     } catch (error) {
         console.error('Error in subcategory selection:', error);
-        await ctx.reply("❌ Error updating category\\. Please try again\\.", { parse_mode: 'MarkdownV2' });
+        await ctx.reply("❌ Error updating category. Please try again.");
     }
 });
 
@@ -1395,40 +1865,52 @@ bot.action('VIEW_EXPENSES', async (ctx) => {
     try {
         await ctx.answerCbQuery();
         
-        const expenses = db.prepare(
-            'SELECT * FROM expenses WHERE user_id = ? ORDER BY timestamp DESC LIMIT 5'
-        ).all(ctx.from.id.toString());
+        db.all(`SELECT * FROM expenses WHERE user_id = ? ORDER BY timestamp DESC LIMIT 5`, [ctx.from.id.toString()], async (err, expenses) => {
+            if (err) {
+                console.error('Error fetching expenses:', err);
+                await ctx.reply("❌ Error viewing expenses\\. Please try again\\.", { parse_mode: 'MarkdownV2' });
+                return;
+            }
 
-        if (expenses.length === 0) {
-            await ctx.reply("No expenses recorded yet\\.", { 
+            if (expenses.length === 0) {
+                await ctx.reply("No expenses recorded yet\\.", { 
+                    parse_mode: 'MarkdownV2',
+                    reply_markup: {
+                        inline_keyboard: [
+                            [
+                                Markup.button.url('🌐 View Dashboard', DASHBOARD_URL)
+                            ]
+                        ]
+                    }
+                });
+                return;
+            }
+
+            const message = expenses.map(exp => {
+                const date = new Date(exp.timestamp).toLocaleDateString();
+                const amount = exp.amount.toString().replace(/[.\-]/g, '\\$&');
+                const category = escapeMarkdownV2(exp.category || 'Uncategorized');
+                const subcategory = escapeMarkdownV2(exp.subcategory || 'Other');
+                return `📅 ${date}: \$${amount}\n📂 ${category} \\- 🏷️ ${subcategory}`;
+            }).join('\n\n');
+
+            await ctx.reply(message, {
                 parse_mode: 'MarkdownV2',
                 reply_markup: {
-                    inline_keyboard: [
-                        [
-                            Markup.button.url('🌐 View Dashboard', DASHBOARD_URL)
-                        ]
+                        inline_keyboard: [
+                            [
+                                Markup.button.callback('🗑️ Delete', `DELETE_${result.lastID}`),
+                                Markup.button.callback('📊 View Last 5', 'VIEW_EXPENSES')
+                            ],
+                            [
+                                Markup.button.callback('❓ Help', 'SHOW_HELP')
+                            ],
+                            [
+                                Markup.button.url('🌐 View Dashboard', DASHBOARD_URL)
+                            ]
                     ]
                 }
             });
-            return;
-        }
-
-        const message = expenses.map(exp => {
-            const date = new Date(exp.timestamp).toLocaleDateString();
-            const amount = exp.amount.toString().replace(/[.\-]/g, '\\$&');
-            const category = escapeMarkdownV2(exp.category);
-            return `📅 ${date}: \$${amount} on ${category}`;
-        }).join('\n');
-
-        await ctx.reply(message, {
-            parse_mode: 'MarkdownV2',
-            reply_markup: {
-                inline_keyboard: [
-                    [
-                        Markup.button.url('🌐 View Dashboard', DASHBOARD_URL)
-                    ]
-                ]
-            }
         });
     } catch (error) {
         console.error('Error in VIEW_EXPENSES:', error);
@@ -1440,8 +1922,7 @@ bot.action('VIEW_EXPENSES', async (ctx) => {
 
 // Delete last expense handler
 bot.action('DELETE_LAST', async (ctx) => {
-    const lastExpense = db.prepare('SELECT * FROM expenses WHERE user_id = ? ORDER BY timestamp DESC LIMIT 1')
-        .get(ctx.from.id.toString());
+    const lastExpense = db.get(`SELECT * FROM expenses WHERE user_id = ? ORDER BY timestamp DESC LIMIT 1`, ctx.from.id.toString());
 
     if (!lastExpense) {
         await ctx.reply("📭 No expenses recorded yet\\.", { parse_mode: 'MarkdownV2' });
@@ -1449,7 +1930,7 @@ bot.action('DELETE_LAST', async (ctx) => {
     }
 
     // Delete the expense
-    db.prepare('DELETE FROM expenses WHERE id = ?').run(lastExpense.id);
+    const result = db.run(`DELETE FROM expenses WHERE id = ?`, lastExpense.id);
 
     const escapedAmount = lastExpense.amount.toString().replace(/[.\-]/g, '\\$&');
     const escapedCategory = escapeMarkdownV2(lastExpense.category);
@@ -1465,39 +1946,64 @@ bot.action(/^DELETE_(\d+)$/, async (ctx) => {
     try {
         await ctx.answerCbQuery();
         const expenseId = ctx.match[1];
+        const userId = ctx.from.id.toString();
         
-        const expense = db.prepare('SELECT * FROM expenses WHERE id = ?').get(expenseId);
-        if (!expense) {
-            await ctx.reply("❌ Expense not found\\.", { parse_mode: 'MarkdownV2' });
-            return;
-        }
-
-        // Delete the expense
-        db.prepare('DELETE FROM expenses WHERE id = ?').run(expenseId);
-
-        const escapedAmount = expense.amount.toString().replace(/[.\-]/g, '\\$&');
-        const escapedCategory = escapeMarkdownV2(expense.category);
-
-        await ctx.reply(
-            `🗑️ Deleted expense: \$${escapedAmount} on ${escapedCategory}`,
-            { 
-                parse_mode: 'MarkdownV2',
-                reply_markup: {
-                    inline_keyboard: [
-                        [
-                            Markup.button.callback('↩️ Undo', `RESTORE_${JSON.stringify({
-                                amount: expense.amount,
-                                category: expense.category
-                            })}`),
-                            Markup.button.callback('📊 View Last 5', 'VIEW_EXPENSES')
-                        ]
-                    ]
-                }
+        // Get the expense first
+        db.get(`SELECT * FROM expenses WHERE id = ? AND user_id = ?`, [expenseId, userId], async (err, expense) => {
+            if (err) {
+                console.error('Error fetching expense:', err);
+                await ctx.reply("❌ Error deleting expense\\. Please try again\\.", { parse_mode: 'MarkdownV2' });
+                return;
             }
-        );
+
+            if (!expense) {
+                await ctx.reply("❌ Expense not found\\.", { parse_mode: 'MarkdownV2' });
+                return;
+            }
+
+            // Delete the expense using a Promise to handle the async operation properly
+            await new Promise((resolve, reject) => {
+                db.run(
+                    `DELETE FROM expenses WHERE id = ? AND user_id = ?`,
+                    [expenseId, userId],
+                    function(err) {
+                        if (err) reject(err);
+                        else resolve(this);
+                    }
+                );
+            }).then(async (result) => {
+                const escapedAmount = expense.amount.toString().replace(/[.\-]/g, '\\$&');
+                const escapedCategory = escapeMarkdownV2(expense.category);
+
+                await ctx.reply(
+                    `🗑️ Deleted expense: \$${escapedAmount} on ${escapedCategory}`,
+                    { 
+                        parse_mode: 'MarkdownV2',
+                        reply_markup: {
+                            inline_keyboard: [
+                                [
+                                    Markup.button.callback('↩️ Undo', `RESTORE_${JSON.stringify({
+                                        amount: expense.amount,
+                                        category: expense.category,
+                                        description: expense.description,
+                                        subcategory: expense.subcategory
+                                    })}`),
+                                    Markup.button.callback('📊 View Last 5', 'VIEW_EXPENSES')
+                                ]
+                            ]
+                        }
+                    }
+                );
+            }).catch(async (error) => {
+                console.error('Error deleting expense:', error);
+                await ctx.reply("❌ Failed to delete expense\\.", { parse_mode: 'MarkdownV2' });
+            });
+        });
     } catch (error) {
         console.error('Error in DELETE handler:', error);
-        await ctx.reply("❌ Error deleting expense\\. Please try again\\.", { parse_mode: 'MarkdownV2' });
+        await ctx.reply("❌ An error occurred while deleting the expense\\. Please try again\\.", { 
+            parse_mode: 'MarkdownV2' 
+        });
     }
 });
 
@@ -1507,11 +2013,26 @@ bot.action(/^RESTORE_(.+)$/, async (ctx) => {
         await ctx.answerCbQuery();
         const data = JSON.parse(ctx.match[1]);
         
-        // Insert the restored expense
+        // Insert the restored expense with all fields
         const timestamp = new Date().toISOString();
-        const result = db.prepare(
-            'INSERT INTO expenses (user_id, amount, category, timestamp) VALUES (?, ?, ?, ?)'
-        ).run(ctx.from.id.toString(), data.amount, data.category, timestamp);
+        const result = await new Promise((resolve, reject) => {
+            db.run(
+                `INSERT INTO expenses (user_id, amount, category, subcategory, description, timestamp) 
+                 VALUES (?, ?, ?, ?, ?, ?)`,
+                [
+                    ctx.from.id.toString(),
+                    data.amount,
+                    data.category,
+                    data.subcategory || 'Other',
+                    data.description || '',
+                    timestamp
+                ],
+                function(err) {
+                    if (err) reject(err);
+                    else resolve(this);
+                }
+            );
+        });
 
         const escapedAmount = data.amount.toString().replace(/[.\-]/g, '\\$&');
         const escapedCategory = escapeMarkdownV2(data.category);
@@ -1523,7 +2044,7 @@ bot.action(/^RESTORE_(.+)$/, async (ctx) => {
                 reply_markup: {
                     inline_keyboard: [
                         [
-                            Markup.button.callback('✏️ Edit', `EDIT_${result.lastInsertRowid}`),
+                            Markup.button.callback('✏️ Edit', `EDIT_${result.lastID}`),
                             Markup.button.callback('📊 View Last 5', 'VIEW_EXPENSES')
                         ]
                     ]
@@ -1568,9 +2089,6 @@ bot.action('SHOW_HELP', async (ctx) => {
                     [
                         Markup.button.callback('📊 View Last 5', 'VIEW_EXPENSES'),
                         Markup.button.callback('📈 View Stats', 'VIEW_STATS')
-                    ],
-                    [
-                        Markup.button.callback('❌ Cancel', 'CANCEL')
                     ]
                 ]
             }
@@ -1589,29 +2107,46 @@ bot.action('VIEW_STATS', async (ctx) => {
         const userId = ctx.from.id.toString();
         
         // Get total expenses
-        const total = db.prepare(
-            'SELECT SUM(amount) as total FROM expenses WHERE user_id = ?'
-        ).get(userId);
+        const total = await new Promise((resolve, reject) => {
+            db.get(
+                'SELECT SUM(amount) as total FROM expenses WHERE user_id = ?',
+                [userId],
+                (err, row) => err ? reject(err) : resolve(row)
+            );
+        });
 
         // Get today's expenses
         const today = new Date().toISOString().split('T')[0];
-        const todayTotal = db.prepare(
-            'SELECT SUM(amount) as total FROM expenses WHERE user_id = ? AND date(timestamp) = ?'
-        ).get(userId, today);
+        const todayTotal = await new Promise((resolve, reject) => {
+            db.get(
+                'SELECT SUM(amount) as total FROM expenses WHERE user_id = ? AND date(timestamp) = date(?)',
+                [userId, today],
+                (err, row) => err ? reject(err) : resolve(row)
+            );
+        });
 
         // Get this month's expenses
         const monthStart = new Date();
         monthStart.setDate(1);
         const monthStartStr = monthStart.toISOString().split('T')[0];
-        const monthTotal = db.prepare(
-            'SELECT SUM(amount) as total FROM expenses WHERE user_id = ? AND date(timestamp) >= ?'
-        ).get(userId, monthStartStr);
+        const monthTotal = await new Promise((resolve, reject) => {
+            db.get(
+                'SELECT SUM(amount) as total FROM expenses WHERE user_id = ? AND date(timestamp) >= date(?)',
+                [userId, monthStartStr],
+                (err, row) => err ? reject(err) : resolve(row)
+            );
+        });
+
+        // Format amounts with proper escaping for MarkdownV2
+        const totalAmount = ((total?.total || 0).toFixed(2)).replace(/\./g, '\\.');
+        const todayAmount = ((todayTotal?.total || 0).toFixed(2)).replace(/\./g, '\\.');
+        const monthAmount = ((monthTotal?.total || 0).toFixed(2)).replace(/\./g, '\\.');
 
         const statsMsg = 
             "📊 *Expense Statistics*\n\n" +
-            `💰 *Total Expenses:* \$${(total.total || 0).toFixed(2)}\n` +
-            `📅 *Today:* \$${(todayTotal.total || 0).toFixed(2)}\n` +
-            `📆 *This Month:* \$${(monthTotal.total || 0).toFixed(2)}`;
+            `💰 *Total Expenses:* \\$${totalAmount}\n` +
+            `📅 *Today:* \\$${todayAmount}\n` +
+            `📆 *This Month:* \\$${monthAmount}`;
 
         await ctx.reply(statsMsg, {
             parse_mode: 'MarkdownV2',
@@ -1620,9 +2155,6 @@ bot.action('VIEW_STATS', async (ctx) => {
                     [
                         Markup.button.callback('📊 View Last 5', 'VIEW_EXPENSES'),
                         Markup.button.callback('🔄 Refresh Stats', 'VIEW_STATS')
-                    ],
-                    [
-                        Markup.button.url('🌐 View Dashboard', DASHBOARD_URL)
                     ]
                 ]
             }
@@ -1644,11 +2176,7 @@ bot.command('stoprecurring', async (ctx) => {
     }
 
     try {
-        const result = db.prepare(`
-            UPDATE recurring_expenses 
-            SET active = 0 
-            WHERE id = ? AND user_id = ?
-        `).run(id, ctx.from.id.toString());
+        const result = db.run(`UPDATE recurring_expenses SET active = 0 WHERE id = ? AND user_id = ?`, id, ctx.from.id.toString());
 
         if (result.changes > 0) {
             await ctx.reply("✅ Recurring expense stopped successfully!");
@@ -1668,7 +2196,6 @@ bot.action('CANCEL_RECURRING', async (ctx) => {
         addingRecurring: false,
         recurringStep: null,
         recurringAmount: null,
-        recurringCategory: null,
         recurringDescription: null
     };
     await ctx.answerCbQuery("❌ Cancelled!");
@@ -1677,18 +2204,31 @@ bot.action('CANCEL_RECURRING', async (ctx) => {
 
 bot.action(/FREQ_(.+)/, async (ctx) => {
     const frequency = ctx.match[1];
-    const { recurringAmount, recurringCategory, recurringDescription } = ctx.session;
+    const { recurringAmount, recurringDescription: rawDescription } = ctx.session;
 
     try {
         const startDate = new Date().toISOString();
-        db.prepare(`
-            INSERT INTO recurring_expenses 
-            (user_id, amount, category, description, frequency, start_date, last_tracked)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-        `).run(
+        
+        // Capitalize the first letter of each word in the description
+        const recurringDescription = rawDescription
+            .split(' ')
+            .map(word => word.charAt(0).toUpperCase() + word.slice(1).toLowerCase())
+            .join(' ');
+
+        // Use async categorization
+        const { category, subcategory } = await categorizeExpense(rawDescription);
+
+        if (!category) {
+            throw new Error('Could not determine category');
+        }
+
+        const result = db.run(
+            `INSERT INTO recurring_expenses (user_id, amount, category, subcategory, description, frequency, start_date, last_tracked) 
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?)`, 
             ctx.from.id.toString(),
             recurringAmount,
-            recurringCategory,
+            category,
+            subcategory || 'Other',
             recurringDescription,
             frequency,
             startDate,
@@ -1699,8 +2239,9 @@ bot.action(/FREQ_(.+)/, async (ctx) => {
         await ctx.reply(
             "🎉 Woohoo! Your recurring expense is all set up!\n\n" +
             `💰 Amount: $${recurringAmount}\n` +
-            `📂 Category: ${recurringCategory}\n` +
             `📝 Description: ${recurringDescription}\n` +
+            `📂 Category: ${category}\n` +
+            `🏷️ Subcategory: ${subcategory || 'Other'}\n` +
             `⏰ Frequency: ${frequency}\n\n` +
             "✅ I'll automatically track this for you and let you know each time!\n\n" +
             "💡 Tip: Use /listrecurring to see all your recurring expenses! 📋"
@@ -1712,7 +2253,6 @@ bot.action(/FREQ_(.+)/, async (ctx) => {
             addingRecurring: false,
             recurringStep: null,
             recurringAmount: null,
-            recurringCategory: null,
             recurringDescription: null
         };
     } catch (error) {
@@ -1772,7 +2312,6 @@ bot.action('CAT_RESTART', async (ctx) => {
         addingRecurring: true,
         recurringStep: 'amount',
         recurringAmount: null,
-        recurringCategory: null,
         recurringDescription: null
     };
     
@@ -1840,12 +2379,7 @@ bot.action('ADD_RECURRING', async (ctx) => {
 
 bot.action('EDIT_RECURRING', async (ctx) => {
     try {
-        const recurring = db.prepare(`
-            SELECT id, amount, description, frequency 
-            FROM recurring_expenses 
-            WHERE user_id = ? AND active = 1
-            ORDER BY frequency, amount
-        `).all(ctx.from.id.toString());
+        const recurring = db.all(`SELECT id, amount, description, frequency FROM recurring_expenses WHERE user_id = ? AND active = 1 ORDER BY frequency, amount`, ctx.from.id.toString());
 
         if (recurring.length === 0) {
             await ctx.answerCbQuery("No recurring expenses to edit!");
@@ -1877,12 +2411,7 @@ bot.action('EDIT_RECURRING', async (ctx) => {
 
 bot.action('REMOVE_RECURRING', async (ctx) => {
     try {
-        const recurring = db.prepare(`
-            SELECT id, amount, description, frequency 
-            FROM recurring_expenses 
-            WHERE user_id = ? AND active = 1
-            ORDER BY frequency, amount
-        `).all(ctx.from.id.toString());
+        const recurring = db.all(`SELECT id, amount, description, frequency FROM recurring_expenses WHERE user_id = ? AND active = 1 ORDER BY frequency, amount`, ctx.from.id.toString());
 
         if (recurring.length === 0) {
             await ctx.answerCbQuery("No recurring expenses to remove!");
@@ -1917,11 +2446,7 @@ bot.action(/REMOVE_REC_(\d+)/, async (ctx) => {
     try {
         const id = ctx.match[1];
         
-        db.prepare(`
-            UPDATE recurring_expenses 
-            SET active = 0 
-            WHERE id = ? AND user_id = ?
-        `).run(id, ctx.from.id.toString());
+        const result = db.run(`UPDATE recurring_expenses SET active = 0 WHERE id = ? AND user_id = ?`, id, ctx.from.id.toString());
 
         await ctx.answerCbQuery("✅ Removed!");
         await ctx.reply("✨ Recurring expense removed successfully!");
@@ -1939,11 +2464,28 @@ bot.action(/REMOVE_REC_(\d+)/, async (ctx) => {
 });
 
 bot.launch().then(() => {
-    console.log('✅ Bot is running');
+    console.log('✅ Telegram bot is running');
 }).catch(error => {
-    console.error('❌ Error starting bot:', error);
+    console.error('❌ Error starting Telegram bot:', error);
+    process.exit(1);
 });
 
 // Enable graceful stop
-process.once('SIGINT', () => bot.stop('SIGINT'));
-process.once('SIGTERM', () => bot.stop('SIGTERM'));
+process.once('SIGINT', () => {
+    console.log('\n👋 Shutting down...');
+    bot.stop('SIGINT');
+    db.close(() => {
+        console.log('  └─ Database connection closed');
+        console.log('  └─ Bot stopped');
+        console.log('✅ Shutdown complete\n');
+    });
+});
+process.once('SIGTERM', () => {
+    console.log('\n👋 Shutting down...');
+    bot.stop('SIGTERM');
+    db.close(() => {
+        console.log('  └─ Database connection closed');
+        console.log('  └─ Bot stopped');
+        console.log('✅ Shutdown complete\n');
+    });
+});
