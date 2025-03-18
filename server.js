@@ -1,61 +1,59 @@
-// Add DELETE endpoint for expenses
-app.delete('/api/expenses/:id', (req, res) => {
+const express = require('express');
+const path = require('path');
+const TelegramBot = require('node-telegram-bot-api');
+const winston = require('winston');
+
+// Configure logger
+const logger = winston.createLogger({
+    level: 'info',
+    format: winston.format.combine(
+        winston.format.timestamp(),
+        winston.format.json()
+    ),
+    transports: [
+        new winston.transports.Console()
+    ]
+});
+
+// Initialize Express app
+const app = express();
+app.use(express.json());
+
+// Initialize your bot with webhook
+const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { webHook: { port: 8443 } });
+
+// Serve static files from the dashboard build directory
+app.use(express.static(path.join(__dirname, 'v0.0.1-dashboard/.next')));
+
+// Health check endpoint for Cloud Run
+app.get('/', (req, res) => {
+    res.status(200).send('Service is running!');
+});
+
+// Webhook endpoint for Telegram bot
+app.post('/webhook', (req, res) => {
+    bot.handleUpdate(req.body);
+    res.sendStatus(200);
+});
+
+// Handle all other routes for the dashboard
+app.get('*', (req, res) => {
+    res.sendFile(path.join(__dirname, 'v0.0.1-dashboard/.next/index.html'));
+});
+
+// Import bot handlers from bot.js
+require('./bot.js')(bot);
+
+// Start the server
+const PORT = process.env.PORT || 8080;
+app.listen(PORT, async () => {
+    logger.info(`Server is running on port ${PORT}`);
+    
+    // Set webhook
     try {
-        const { id } = req.params;
-        db.prepare('DELETE FROM expenses WHERE id = ?').run(id);
-        res.json({ success: true });
+        await bot.setWebHook(`https://hornerito-bot-153139743231.us-central1.run.app/webhook`);
+        logger.info('Webhook set successfully');
     } catch (error) {
-        console.error('Error deleting expense:', error);
-        res.status(500).json({ error: 'Error deleting expense' });
+        logger.error('Error setting webhook:', error);
     }
-});
-
-// Update the GET endpoint for expenses to match the actual query being used
-app.get('/api/expenses', (req, res) => {
-    try {
-        // Get all expenses, using the same query that's working in index.js
-        const expenses = db.prepare(`
-            SELECT * FROM expenses 
-            ORDER BY timestamp DESC
-        `).all();
-
-        // Log the response for debugging
-        console.log(`Sending ${expenses.length} expenses to dashboard`);
-        console.log('Sample expense:', expenses[0]);
-
-        res.json({ expenses });
-    } catch (error) {
-        console.error('Error fetching expenses:', error);
-        res.status(500).json({ error: 'Error fetching expenses' });
-    }
-});
-
-// Make sure database is properly initialized
-const db = new sqlite3('data/hornerito.db', {
-    fileMustExist: false,
-    verbose: console.log
-});
-
-// Log database path
-console.log('Database path:', path.resolve('data/hornerito.db'));
-
-// Test database connection
-try {
-    const testQuery = db.prepare('SELECT 1').get();
-    console.log('Database connection test:', testQuery);
-} catch (error) {
-    console.error('Database connection error:', error);
-    process.exit(1);
-}
-
-// Add error handling middleware
-app.use((err, req, res, next) => {
-    console.error('Server error:', err);
-    res.status(500).json({ error: 'Internal server error' });
-});
-
-// Log when server starts
-app.listen(3000, () => {
-    console.log('Dashboard server running on port 3000');
-    console.log('Database location:', path.resolve('data/hornerito.db'));
 }); 
