@@ -19,7 +19,7 @@ const app = express();
 app.use(express.json());
 
 // Initialize your bot with webhook
-const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { webHook: { port: 8080 } });
+const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { webHook: { port: 8443 } });
 
 // Health check endpoint for Cloud Run
 app.get('/', (req, res) => {
