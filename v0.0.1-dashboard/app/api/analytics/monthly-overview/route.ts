@@ -1,16 +1,20 @@
 import { NextResponse } from 'next/server';
 
+interface DailyData {
+  date: string;
+  amount: number;
+}
+
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
 
 export async function GET() {
   try {
     // Generate mock data for the last 30 days
-    const mockData = [];
-    const currentDate = new Date();
+    const mockData: DailyData[] = [];
+    const date = new Date();
 
-    for (let i = 0; i < 30; i++) {
-      const date = new Date(currentDate);
+    for (let i = 29; i >= 0; i--) {
       date.setDate(date.getDate() - i);
       
       mockData.push({
@@ -19,9 +23,12 @@ export async function GET() {
       });
     }
 
-    return NextResponse.json(mockData.reverse());
+    return NextResponse.json(mockData);
   } catch (error) {
     console.error('Error generating monthly overview:', error);
-    return NextResponse.json({ error: 'Failed to generate monthly overview' }, { status: 500 });
+    return NextResponse.json(
+      { error: 'Failed to generate monthly overview' },
+      { status: 500 }
+    );
   }
 } 
