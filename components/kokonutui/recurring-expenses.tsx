@@ -1,7 +1,19 @@
 import React, { useState } from 'react';
 
+interface RecurringExpense {
+  id: string;
+  amount: number;
+  category: string;
+  description: string;
+  frequency: string;
+  startDate: string;
+  endDate?: string;
+  lastTracked: string;
+  active: boolean;
+}
+
 interface RecurringExpensesProps {
-  expenses: any[];
+  expenses: RecurringExpense[];
   loading: boolean;
 }
 
