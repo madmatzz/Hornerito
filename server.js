@@ -2,6 +2,8 @@ const express = require('express');
 const path = require('path');
 const TelegramBot = require('node-telegram-bot-api');
 const winston = require('winston');
+const { connectDB } = require('./database');
+require('dotenv').config();
 
 // Configure logger
 const logger = winston.createLogger({
@@ -23,9 +25,9 @@ app.use(express.json());
 const bot = new TelegramBot(process.env.TELEGRAM_BOT_TOKEN, { webHook: { port: 8443 } });
 
 // Serve static files from the dashboard build directory
-app.use(express.static(path.join(__dirname, 'v0.0.1-dashboard/.next')));
+app.use(express.static(path.join(__dirname, '.next')));
 
-// Health check endpoint for Cloud Run
+// Health check endpoint
 app.get('/', (req, res) => {
     res.status(200).send('Service is running!');
 });
@@ -38,22 +40,38 @@ app.post('/webhook', (req, res) => {
 
 // Handle all other routes for the dashboard
 app.get('*', (req, res) => {
-    res.sendFile(path.join(__dirname, 'v0.0.1-dashboard/.next/index.html'));
+    res.sendFile(path.join(__dirname, '.next/index.html'));
 });
 
-// Import bot handlers from bot.js
-require('./bot.js')(bot);
+// Import bot handlers from lib/bot.js
+const { handleUpdate } = require('./lib/bot');
+bot.on('message', handleUpdate);
 
 // Start the server
 const PORT = process.env.PORT || 8080;
-app.listen(PORT, async () => {
-    logger.info(`Server is running on port ${PORT}`);
-    
-    // Set webhook
+
+const startServer = async () => {
     try {
-        await bot.setWebHook(`https://hornerito-bot-153139743231.us-central1.run.app/webhook`);
-        logger.info('Webhook set successfully');
+        // Connect to MongoDB
+        await connectDB();
+        
+        // Start Express server
+        app.listen(PORT, async () => {
+            logger.info(`Server is running on port ${PORT}`);
+            
+            // Set webhook
+            try {
+                const webhookUrl = process.env.WEBHOOK_URL || `https://your-render-url.onrender.com/webhook`;
+                await bot.setWebHook(webhookUrl);
+                logger.info('Webhook set successfully');
+            } catch (error) {
+                logger.error('Error setting webhook:', error);
+            }
+        });
     } catch (error) {
-        logger.error('Error setting webhook:', error);
+        logger.error('Failed to start server:', error);
+        process.exit(1);
     }
-}); 
+};
+
+startServer(); 

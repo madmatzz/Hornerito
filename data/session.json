@@ -1,0 +1,16 @@
+{
+  "editingExpenseId": null,
+  "originalCategory": null,
+  "originalAmount": null,
+  "userId": null,
+  "sessions": [
+    {
+      "id": "1632629622:1632629622",
+      "data": {
+        "editMode": "amount",
+        "originalCategory": null,
+        "originalAmount": null
+      }
+    }
+  ]
+}

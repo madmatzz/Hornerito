@@ -1,3 +1,24 @@
+Start Both Services
+You have two options:
+Option A - Using Concurrent Start (Recommended)
+
+    npm run dev
+
+This will start both the bot and dashboard simultaneously.
+Option B - Start Separately (If Option A doesn't work)
+
+Terminal 1:
+ node index.js
+
+Terminal 2:
+cd v0.0.1-dashboard
+   npm run dev
+
+Open two separate terminal windows:
+Terminal 1 (Bot & Backend):
+Terminal 2 (Dashboard):
+
+
 Para iniciar ngrok en el puerto 3000, usa este comando en la terminal: ngrok http 3000
 
 📌 Importante:
@@ -6,10 +27,4 @@ Cada vez que reinicias ngrok, la URL cambia, así que debes actualizarla en el w
 curl -X POST "https://api.telegram.org/botYOUR_TELEGRAM_BOT_TOKEN/setWebhook?url=YOUR_NGROK_URL/telegram_webhook"
 
 Restart bot: node index.js
-
-
-
-
-
-curl -X POST "https://api.telegram.org/bot8045427311:AAH8cz__CQ_Wnp1FW1dj4R07sOKtMcFwEOg/setWebhook?url=https://ca86-191-97-151-232.ngrok-free.app/telegram_webhook"
 

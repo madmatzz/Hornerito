@@ -2,6 +2,7 @@ import type { Metadata } from "next";
 import { Inter } from "next/font/google";
 import "./globals.css";
 import { ThemeProvider } from "@/components/theme-provider";
+import { Toaster } from "react-hot-toast";
 
 const inter = Inter({ subsets: ["latin"] });
 
@@ -17,16 +18,15 @@ export default function RootLayout({
 }>) {
   return (
     <html lang="en" suppressHydrationWarning>
-      <body className={`${inter.className} min-h-screen bg-zinc-950 text-zinc-50`}>
+      <body className={inter.className}>
         <ThemeProvider
           attribute="class"
-          defaultTheme="dark"
-          enableSystem={false}
-          storageKey="dashboard-theme"
+          defaultTheme="system"
+          enableSystem
+          disableTransitionOnChange
         >
-          <main className="min-h-screen">
-            {children}
-          </main>
+          {children}
+          <Toaster position="top-right" />
         </ThemeProvider>
       </body>
     </html>

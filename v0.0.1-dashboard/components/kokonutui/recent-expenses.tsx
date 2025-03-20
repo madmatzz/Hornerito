@@ -1,6 +1,7 @@
 'use client';
 
-import { formatCurrency } from "@/lib/utils";
+import { useState } from "react";
+import { formatCurrency, getExpenseEmoji } from "@/lib/utils";
 import {
   Table,
   TableBody,
@@ -10,59 +11,142 @@ import {
   TableRow,
 } from "@/components/ui/table";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
+import { Pencil, Trash2 } from "lucide-react";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
+import { motion, AnimatePresence } from "framer-motion";
+import EditExpenseDialog from "./edit-expense-dialog";
+import { UpdateExpenseData } from "@/lib/api";
+import { cn } from "@/lib/utils";
+import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card";
+import { format } from "date-fns";
+import { Edit2 } from "lucide-react";
 
 interface RecentExpensesProps {
   expenses: Expense[];
-  showAll?: boolean;
+  loading?: boolean;
+  onUpdateExpense?: (id: number, data: UpdateExpenseData) => Promise<void>;
+  onDeleteExpense?: (id: number) => Promise<void>;
 }
 
-export default function RecentExpenses({ expenses, showAll = false }: RecentExpensesProps) {
-  const displayExpenses = showAll ? expenses : expenses.slice(0, 5);
+export function RecentExpenses({
+  expenses = [],
+  loading = false,
+  onUpdateExpense,
+  onDeleteExpense
+}: RecentExpensesProps) {
+  const [editingExpense, setEditingExpense] = useState<Expense | null>(null);
+
+  if (loading) {
+    return (
+      <Card>
+        <CardHeader>
+          <CardTitle className="animate-pulse bg-gray-200 h-6 w-48 rounded" />
+          <CardDescription className="animate-pulse bg-gray-200 h-4 w-32 rounded mt-2" />
+        </CardHeader>
+        <CardContent>
+          <div className="space-y-4">
+            {[...Array(5)].map((_, i) => (
+              <div key={i} className="animate-pulse bg-gray-200 h-12 w-full rounded" />
+            ))}
+          </div>
+        </CardContent>
+      </Card>
+    );
+  }
 
   return (
-    <div className="space-y-4">
-      <Table>
-        <TableHeader>
-          <TableRow>
-            <TableHead>Description</TableHead>
-            <TableHead>Category</TableHead>
-            <TableHead>Date</TableHead>
-            <TableHead className="text-right">Amount</TableHead>
-            <TableHead className="text-right">Type</TableHead>
-          </TableRow>
-        </TableHeader>
-        <TableBody>
-          {displayExpenses.map((expense) => (
-            <TableRow key={expense.id}>
-              <TableCell className="font-medium">
-                {expense.description || 'Unnamed expense'}
-              </TableCell>
-              <TableCell>
-                <Badge variant="secondary" className="bg-zinc-800 text-zinc-100">
-                  {expense.displayCategory}
-                </Badge>
-              </TableCell>
-              <TableCell>
-                {new Date(expense.date).toLocaleDateString()}
-              </TableCell>
-              <TableCell className="text-right">
-                {formatCurrency(expense.amount)}
-              </TableCell>
-              <TableCell className="text-right">
-                {expense.is_recurring ? (
-                  <Badge variant="secondary" className="bg-blue-500/10 text-blue-500">
-                    Recurring
-                  </Badge>
-                ) : (
-                  <Badge variant="secondary" className="bg-zinc-500/10 text-zinc-500">
-                    One-time
-                  </Badge>
-                )}
-              </TableCell>
-            </TableRow>
-          ))}
-        </TableBody>
-      </Table>
-    </div>
+    <Card>
+      <CardHeader>
+        <CardTitle>Recent Expenses</CardTitle>
+        <CardDescription>Your latest transactions</CardDescription>
+      </CardHeader>
+      <CardContent>
+        {expenses.length === 0 ? (
+          <div className="text-center py-6 text-gray-500">
+            No expenses found
+          </div>
+        ) : (
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Date</TableHead>
+                <TableHead>Description</TableHead>
+                <TableHead>Category</TableHead>
+                <TableHead>Amount</TableHead>
+                <TableHead className="text-right">Actions</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {expenses.map((expense) => (
+                <TableRow key={expense.id}>
+                  <TableCell>{format(new Date(expense.date), 'MMM d, yyyy')}</TableCell>
+                  <TableCell className="font-medium">{expense.description}</TableCell>
+                  <TableCell>
+                    <div className="flex flex-col">
+                      <span>{expense.category}</span>
+                      {expense.subcategory && (
+                        <span className="text-xs text-muted-foreground">{expense.subcategory}</span>
+                      )}
+                    </div>
+                  </TableCell>
+                  <TableCell>{formatCurrency(expense.amount)}</TableCell>
+                  <TableCell className="text-right">
+                    <div className="flex justify-end gap-2">
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        onClick={() => setEditingExpense(expense)}
+                      >
+                        <Edit2 className="h-4 w-4" />
+                        <span className="sr-only">Edit</span>
+                      </Button>
+                      <Button
+                        variant="ghost"
+                        size="icon"
+                        onClick={() => onDeleteExpense?.(expense.id)}
+                      >
+                        <Trash2 className="h-4 w-4" />
+                        <span className="sr-only">Delete</span>
+                      </Button>
+                    </div>
+                  </TableCell>
+                </TableRow>
+              ))}
+            </TableBody>
+          </Table>
+        )}
+      </CardContent>
+      <div className="p-6 pt-0">
+        <Button
+          variant="outline"
+          className="w-full"
+          onClick={() => window.location.href = '/dashboard/transactions'}
+        >
+          View all expenses
+        </Button>
+      </div>
+
+      <EditExpenseDialog
+        expense={editingExpense}
+        open={!!editingExpense}
+        onClose={() => setEditingExpense(null)}
+        onSave={async (data) => {
+          if (editingExpense) {
+            await onUpdateExpense?.(editingExpense.id, data);
+            setEditingExpense(null);
+          }
+        }}
+      />
+    </Card>
   );
 } 

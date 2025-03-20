@@ -18,7 +18,10 @@
     "next": "^14.0.0",
     "react": "^18.2.0",
     "react-dom": "^18.2.0",
-    "chart.js": "^4.4.0"
+    "chart.js": "^4.4.0",
+    "axios": "^1.6.0",
+    "telegraf-session-local": "^2.0.0",
+    "openai": "^4.0.0"
   },
   "devDependencies": {
     "nodemon": "^3.0.3",

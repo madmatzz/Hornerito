@@ -1,8 +1,21 @@
+import { ReactNode } from 'react';
 import { CreditCard, Wallet, PiggyBank, Plus } from "lucide-react"
 import List01 from "./list-01"
 import List02 from "./list-02"
 import List03 from "./list-03"
 import { cn } from "@/lib/utils"
+
+interface ContentProps {
+  children: ReactNode;
+}
+
+export function Content({ children }: ContentProps) {
+  return (
+    <div className="container mx-auto max-w-7xl">
+      {children}
+    </div>
+  );
+}
 
 export default function () {
   return (

@@ -1,20 +1,44 @@
-const Database = require('better-sqlite3');
+const mongoose = require('mongoose');
+const winston = require('winston');
 
-// Connect to (or create) the database file 'hornerito.db'
-const db = new Database('hornerito.db', { verbose: console.log });
+// Configure logger
+const logger = winston.createLogger({
+    level: 'info',
+    format: winston.format.combine(
+        winston.format.timestamp(),
+        winston.format.json()
+    ),
+    transports: [
+        new winston.transports.Console()
+    ]
+});
 
-// Drop the existing table and recreate it with the correct schema
-db.exec(`
-  DROP TABLE IF EXISTS expenses;
-  CREATE TABLE expenses (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    user_id TEXT,
-    amount REAL,
-    category TEXT,
-    timestamp TEXT DEFAULT (datetime('now'))
-  );
-`);
+// Connect to MongoDB
+const connectDB = async () => {
+    try {
+        const conn = await mongoose.connect(process.env.MONGODB_URI, {
+            useNewUrlParser: true,
+            useUnifiedTopology: true
+        });
+        logger.info(`MongoDB Connected: ${conn.connection.host}`);
+    } catch (error) {
+        logger.error(`Error: ${error.message}`);
+        process.exit(1);
+    }
+};
 
-console.log('📁 Database ready.');
+// Define schemas
+const expenseSchema = new mongoose.Schema({
+    userId: String,
+    amount: Number,
+    category: String,
+    description: String,
+    date: { type: Date, default: Date.now }
+});
 
-module.exports = db;
+const Expense = mongoose.model('Expense', expenseSchema);
+
+module.exports = {
+    connectDB,
+    Expense
+};

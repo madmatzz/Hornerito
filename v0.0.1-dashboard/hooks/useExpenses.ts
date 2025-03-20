@@ -7,7 +7,8 @@ export interface Expense {
   id: number;
   amount: number;
   category: string;
-  displayCategory: string;
+  subcategory: string;
+  displayCategory?: string;
   description: string;
   date: string;
   is_recurring: boolean;
@@ -20,6 +21,30 @@ export function useExpenses() {
   const [recurringExpenses, setRecurringExpenses] = useState<Expense[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<Error | null>(null);
+
+  const mutate = (newExpenses: Expense[]) => {
+    setExpenses(newExpenses);
+    setRecentExpenses(newExpenses.slice(0, 5));
+  };
+
+  const refetch = async () => {
+    try {
+      setLoading(true);
+      setError(null);
+      const allExp = await getExpenses();
+      const recentExp = await getRecentExpenses();
+      const recurringExp = await getRecurringExpenses();
+      
+      if (Array.isArray(allExp)) setExpenses(allExp);
+      if (Array.isArray(recentExp)) setRecentExpenses(recentExp);
+      if (Array.isArray(recurringExp)) setRecurringExpenses(recurringExp);
+      
+      setLoading(false);
+    } catch (err) {
+      setError(err instanceof Error ? err : new Error('Failed to fetch expenses'));
+      setLoading(false);
+    }
+  };
 
   useEffect(() => {
     async function fetchData() {
@@ -102,6 +127,8 @@ export function useExpenses() {
     recentExpenses,
     recurringExpenses,
     loading,
-    error
+    error,
+    mutate,
+    refetch
   };
 } 

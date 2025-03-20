@@ -1,74 +1,95 @@
-import axios from 'axios';
-
-const API_BASE_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:3000';
-
-console.log('API Base URL:', API_BASE_URL);
-
-const api = axios.create({
-  baseURL: API_BASE_URL,
-  headers: {
-    'Content-Type': 'application/json',
-  },
-  // Add timeout and validation
-  timeout: 10000,
-  validateStatus: (status) => status >= 200 && status < 500,
-});
-
-export const getExpenses = async () => {
-  try {
-    console.log('Fetching expenses from:', `${API_BASE_URL}/api/expenses`);
-    const response = await api.get('/api/expenses');
-    console.log('Expenses response:', response.status, response.statusText);
-    return response.data;
-  } catch (error) {
-    console.error('Error fetching expenses:', error);
-    if (axios.isAxiosError(error)) {
-      console.error('Axios error details:', {
-        status: error.response?.status,
-        data: error.response?.data,
-        headers: error.response?.headers,
-      });
-    }
-    throw error;
+// Helper function to handle API responses
+async function handleResponse(response: Response) {
+  if (!response.ok) {
+    const error = await response.json().catch(() => ({}));
+    throw new Error(error.message || 'API request failed');
   }
-};
+  return response.json();
+}
 
-export const getRecentExpenses = async () => {
-  try {
-    console.log('Fetching recent expenses from:', `${API_BASE_URL}/api/recent-expenses`);
-    const response = await api.get('/api/recent-expenses');
-    console.log('Recent expenses response:', response.status, response.statusText);
-    return response.data;
-  } catch (error) {
-    console.error('Error fetching recent expenses:', error);
-    if (axios.isAxiosError(error)) {
-      console.error('Axios error details:', {
-        status: error.response?.status,
-        data: error.response?.data,
-        headers: error.response?.headers,
-      });
-    }
-    throw error;
-  }
-};
+export async function fetchFromApi(endpoint: string, options: RequestInit = {}) {
+  const defaultOptions: RequestInit = {
+    headers: {
+      'Content-Type': 'application/json',
+    },
+  };
 
-export const getRecurringExpenses = async () => {
-  try {
-    console.log('Fetching recurring expenses from:', `${API_BASE_URL}/api/recurring-expenses`);
-    const response = await api.get('/api/recurring-expenses');
-    console.log('Recurring expenses response:', response.status, response.statusText);
-    return response.data;
-  } catch (error) {
-    console.error('Error fetching recurring expenses:', error);
-    if (axios.isAxiosError(error)) {
-      console.error('Axios error details:', {
-        status: error.response?.status,
-        data: error.response?.data,
-        headers: error.response?.headers,
-      });
-    }
-    throw error;
-  }
-};
+  const response = await fetch(endpoint, {
+    ...defaultOptions,
+    ...options,
+  });
 
-export default api; 
+  return handleResponse(response);
+}
+
+export interface UpdateExpenseData {
+  amount?: number;
+  category?: string;
+  subcategory?: string;
+  description?: string;
+  date?: string;
+  is_recurring?: boolean;
+  frequency?: string | null;
+}
+
+export interface CreateExpenseData {
+  amount: number;
+  category: string;
+  subcategory?: string;
+  description?: string;
+  date?: string;
+  is_recurring?: boolean;
+  frequency?: string | null;
+}
+
+// API functions for expenses
+export async function getExpenses() {
+  return fetchFromApi('/api/expenses');
+}
+
+export async function getRecentExpenses() {
+  return fetchFromApi('/api/expenses/recent');
+}
+
+export async function createExpense(data: CreateExpenseData) {
+  return fetchFromApi('/api/expenses', {
+    method: 'POST',
+    body: JSON.stringify(data),
+  });
+}
+
+export async function updateExpense(id: number, data: UpdateExpenseData) {
+  return fetchFromApi(`/api/expenses/${id}`, {
+    method: 'PUT',
+    body: JSON.stringify(data),
+  });
+}
+
+export async function deleteExpense(id: number) {
+  return fetchFromApi(`/api/expenses/${id}`, {
+    method: 'DELETE',
+  });
+}
+
+// API functions for recurring expenses
+export async function getRecurringExpenses() {
+  return fetchFromApi('/api/expenses/recurring');
+}
+
+export async function createRecurringExpense(data: {
+  icon: string;
+  description: string;
+  amount: number;
+  start_date: string;
+  is_recurring: boolean;
+}) {
+  return fetchFromApi('/api/expenses/recurring', {
+    method: 'POST',
+    body: JSON.stringify(data),
+  });
+}
+
+// API functions for analytics
+export async function getMonthlyAnalytics() {
+  return fetchFromApi('/api/analytics/monthly-overview');
+} 

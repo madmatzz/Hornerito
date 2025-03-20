@@ -9,10 +9,20 @@ const categorizer = require('./categorizer');
 const OpenAI = require('openai');
 const cors = require('cors');
 const compression = require('compression');
+const fs = require('fs');
 
 console.log('\n🤖 Starting Hornerito Bot...\n');
 
 const app = express();
+
+// Define dataDir at the top of the file, right after the imports
+const dataDir = path.join(__dirname, 'data');
+
+// Ensure data directory exists
+if (!fs.existsSync(dataDir)) {
+    fs.mkdirSync(dataDir, { recursive: true });
+    console.log('Created data directory:', dataDir);
+}
 
 // Enable compression
 app.use(compression());
@@ -40,41 +50,79 @@ if (!TELEGRAM_BOT_TOKEN) {
 console.log('🤖 Initializing Telegram bot...');
 const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
 
-// Configure local session middleware
-const localSession = new LocalSession({
-    database: 'data/session.json',
-    property: 'session',
-    storage: LocalSession.storageMemory,
-    format: {
-        serialize: (obj) => JSON.stringify(obj, null, 2),
-        deserialize: (str) => JSON.parse(str),
-    },
-    state: {
-        editingExpenseId: null,
-        originalCategory: null,
-        originalAmount: null,
-        userId: null
-    },
-    // Add this to prevent using deprecated util._extend
-    extend: (sessionData, defaultData) => Object.assign({}, defaultData, sessionData)
-});
+// Define localSession outside the try block
+let localSession;
 
-// Ensure data directory exists
-const fs = require('fs');
-const dataDir = path.join(__dirname, 'data');
-if (!fs.existsSync(dataDir)) {
-    fs.mkdirSync(dataDir, { recursive: true });
-    console.log('Created data directory:', dataDir);
+try {
+    localSession = new LocalSession({
+        database: path.join(dataDir, 'session.json'), // Use dataDir here
+        property: 'session',
+        storage: LocalSession.storageFileSync,
+        format: {
+            serialize: (obj) => {
+                try {
+                    return JSON.stringify(obj, null, 2);
+                } catch (error) {
+                    console.error('Error serializing session:', error);
+                    return JSON.stringify({});
+                }
+            },
+            deserialize: (str) => {
+                try {
+                    return JSON.parse(str);
+                } catch (error) {
+                    console.error('Error deserializing session, resetting:', error);
+                    return {};
+                }
+            },
+        },
+        state: {
+            editingExpenseId: null,
+            originalCategory: null,
+            originalAmount: null,
+            userId: null
+        }
+    });
+
+    // Initialize session file if it doesn't exist
+    const sessionFile = path.join(dataDir, 'session.json');
+    if (!fs.existsSync(sessionFile)) {
+        try {
+            fs.writeFileSync(sessionFile, JSON.stringify({}), 'utf8');
+            console.log('Created empty session file:', sessionFile);
+        } catch (error) {
+            console.error('Error creating session file:', error);
+        }
+    }
+
+    // Use the local session middleware directly without wrapping
+    bot.use(localSession.middleware());
+} catch (error) {
+    console.error('❌ Error initializing session middleware:', error);
+    // Create a fallback session middleware that does nothing but pass through
+    bot.use((ctx, next) => {
+        ctx.session = ctx.session || {};
+        return next();
+    });
 }
 
-// Use the local session middleware
-bot.use(localSession.middleware());
-
 // Add session debug middleware with more detailed logging
-bot.use((ctx, next) => {
+bot.use(async (ctx, next) => {
     if (ctx.from) {
         const sessionId = ctx.from.id || 'unknown';
+        const actionType = ctx.updateType || 'unknown';
+        const callbackQuery = ctx.callbackQuery ? ctx.callbackQuery.data : 'none';
+        
         console.log(`\n🔍 Session state for user ${sessionId}:`, JSON.stringify(ctx.session, null, 2));
+        console.log(`   Action type: ${actionType}`);
+        
+        if (callbackQuery !== 'none') {
+            console.log(`   Callback data: ${callbackQuery}`);
+        }
+        
+        if (ctx.message && ctx.message.text) {
+            console.log(`   Message text: ${ctx.message.text}`);
+        }
     }
     return next();
 });
@@ -157,6 +205,7 @@ const initDatabase = () => {
                 description TEXT,
                 frequency TEXT NOT NULL,
                 start_date TEXT NOT NULL,
+                end_date TEXT,
                 last_tracked TEXT NOT NULL,
                 active INTEGER DEFAULT 1,
                 created_at TEXT DEFAULT CURRENT_TIMESTAMP
@@ -187,6 +236,27 @@ const initDatabase = () => {
                                 console.log('Successfully added subcategory column');
                             });
                         }
+
+                        // Add end_date column if it doesn't exist
+                        db.get(`SELECT COUNT(*) as count FROM pragma_table_info('recurring_expenses') WHERE name='end_date'`, [], (err, row) => {
+                            if (err) {
+                                console.error('Error checking for end_date column:', err);
+                                reject(err);
+                                return;
+                            }
+
+                            if (row.count === 0) {
+                                console.log('Adding end_date column to recurring_expenses table...');
+                                db.run(`ALTER TABLE recurring_expenses ADD COLUMN end_date TEXT`, [], (err) => {
+                                    if (err && !err.message.includes('duplicate column')) {
+                                        console.error('Error adding end_date column:', err);
+                                        reject(err);
+                                        return;
+                                    }
+                                    console.log('Successfully added end_date column');
+                                });
+                            }
+                        });
 
                         // Verify tables and data
                         db.all(`SELECT COUNT(*) as count FROM expenses`, [], (err, result) => {
@@ -884,6 +954,7 @@ async function showRecurringExpenses(ctx) {
                 description TEXT,
                 frequency TEXT,
                 start_date TEXT,
+                end_date TEXT,
                 last_tracked TEXT,
                 active INTEGER DEFAULT 1
             )
@@ -907,6 +978,7 @@ async function showRecurringExpenses(ctx) {
                 description,
                 frequency,
                 start_date,
+                end_date,
                 last_tracked,
                 active
             FROM recurring_expenses 
@@ -1176,59 +1248,64 @@ bot.on('text', async (ctx) => {
                 return;
             }
 
-            // Update the expense amount with user_id check
-            db.run(
-                `UPDATE expenses SET amount = ? WHERE id = ? AND user_id = ?`,
-                [amount, ctx.session.editingExpenseId, userId],
-                async function(err) {
-                    if (err) {
-                        console.error('Error updating amount:', err);
-                        await ctx.reply("❌ Error updating amount\\. Please try again\\.", { parse_mode: 'MarkdownV2' });
-                        return;
-                    }
+            try {
+                // Store the expense ID before clearing session
+                const editedExpenseId = ctx.session.editingExpenseId;
+                const originalCategory = ctx.session.originalCategory || 'Uncategorized';
 
-                    if (this.changes === 0) {
-                        console.log(`No expense updated for ID ${ctx.session.editingExpenseId} and user ${userId}`);
-                        await ctx.reply("❌ Failed to update amount\\.", { parse_mode: 'MarkdownV2' });
-                        return;
-                    }
-
-                    console.log(`Successfully updated amount for expense ${ctx.session.editingExpenseId}`);
-                    
-                    const escapedAmount = amount.toString().replace(/[.\-]/g, '\\$&');
-                    const escapedCategory = escapeMarkdownV2(ctx.session.originalCategory || 'Uncategorized');
-
-                    await ctx.reply(
-                        `✅ Amount updated: \$${escapedAmount} on ${escapedCategory}`,
-                        {
-                            parse_mode: 'MarkdownV2',
-                            reply_markup: {
-                                inline_keyboard: [
-                                    [
-                                        Markup.button.callback('🗑️ Delete', `DELETE_${ctx.session.editingExpenseId}`),
-                                        Markup.button.callback('📊 View Last 5', 'VIEW_EXPENSES')
-                                    ],
-                                    [
-                                        Markup.button.callback('❓ Help', 'SHOW_HELP')
-                                    ]
-                                ]
-                            }
+                // Update the expense amount with user_id check
+                await new Promise((resolve, reject) => {
+                    db.run(
+                        `UPDATE expenses SET amount = ? WHERE id = ? AND user_id = ?`,
+                        [amount, editedExpenseId, userId],
+                        function(err) {
+                            if (err) reject(err);
+                            else resolve(this);
                         }
                     );
+                });
 
-                    // Clear the editing session
-                    ctx.session = {
-                        editingExpenseId: null,
-                        originalCategory: null,
-                        originalAmount: null,
-                        userId: null
-                    };
-                }
-            );
-            return;
+                const escapedAmount = amount.toString().replace(/[.\-]/g, '\\$&');
+                const escapedCategory = escapeMarkdownV2(originalCategory);
+
+                await ctx.reply(
+                    `✅ Amount updated: \$${escapedAmount} on ${escapedCategory}`,
+                    {
+                        parse_mode: 'MarkdownV2',
+                        reply_markup: {
+                            inline_keyboard: [
+                                [
+                                    Markup.button.callback('✏️ Edit Amount Again', `EDIT_${editedExpenseId}`),
+                                    Markup.button.callback('📝 Edit Category', `EDITCAT_${editedExpenseId}`)
+                                ],
+                                [
+                                    Markup.button.callback('📊 View Expenses', 'VIEW_EXPENSES'),
+                                    Markup.button.callback('🏠 Main Menu', 'START')
+                                ]
+                            ]
+                        }
+                    }
+                );
+
+                // Clear the editing session
+                ctx.session = {
+                    ...ctx.session,
+                    editingExpenseId: null,
+                    originalCategory: null,
+                    originalAmount: null,
+                    userId: null
+                };
+                await localSession.saveSession(ctx.session);
+                console.log('Session cleared after successful edit');
+                return;
+            } catch (error) {
+                console.error('Error updating amount:', error);
+                await ctx.reply("❌ Error updating amount\\. Please try again\\.", { parse_mode: 'MarkdownV2' });
+                return;
+            }
         }
 
-        // Check if it's a conversational message
+        // Only proceed with conversation/expense handling if not editing
         if (isConversational(text)) {
             try {
                 const completion = await openai.chat.completions.create({
@@ -1304,16 +1381,19 @@ bot.on('text', async (ctx) => {
                 }
 
                 const timestamp = new Date().toISOString();
-                const result = db.run(
-                    `INSERT INTO expenses (user_id, amount, category, subcategory, description, timestamp) 
-                     VALUES (?, ?, ?, ?, ?, ?)`,
-                    ctx.from.id.toString(),
-                    amount,
-                    category,
-                    subcategory || 'Other',
-                    expenseDescription,
-                    timestamp
-                );
+                
+                // Use a Promise to properly capture the lastID
+                const result = await new Promise((resolve, reject) => {
+                    db.run(
+                        `INSERT INTO expenses (user_id, amount, category, subcategory, description, timestamp) 
+                         VALUES (?, ?, ?, ?, ?, ?)`,
+                        [ctx.from.id.toString(), amount, category, subcategory || 'Other', expenseDescription, timestamp],
+                        function(err) {
+                            if (err) reject(err);
+                            else resolve({ lastID: this.lastID });
+                        }
+                    );
+                });
 
                 const escapedAmount = amount.toString().replace(/[.\-]/g, '\\$&');
                 const escapedCategory = escapeMarkdownV2(category);
@@ -1330,14 +1410,15 @@ bot.on('text', async (ctx) => {
                     reply_markup: {
                         inline_keyboard: [
                             [
+                                Markup.button.callback('✏️ Edit Amount', `EDIT_${result.lastID}`),
+                                Markup.button.callback('📝 Edit Category', `EDITCAT_${result.lastID}`)
+                            ],
+                            [
                                 Markup.button.callback('🗑️ Delete', `DELETE_${result.lastID}`),
                                 Markup.button.callback('📊 View Last 5', 'VIEW_EXPENSES')
                             ],
                             [
-                                Markup.button.callback('❓ Help', 'SHOW_HELP')
-                            ],
-                            [
-                                Markup.button.url('🌐 View Dashboard', DASHBOARD_URL)
+                                Markup.button.callback('🌐 View Dashboard', 'VIEW_DASHBOARD')
                             ]
                         ]
                     }
@@ -1403,10 +1484,15 @@ bot.action('CANCEL', async (ctx) => {
         }
         
         // Clear the editing session
-        delete ctx.session.editingExpenseId;
-        delete ctx.session.userId;
+        ctx.session = {
+            ...ctx.session,
+            editingExpenseId: null,
+            originalCategory: null,
+            originalAmount: null,
+            userId: null
+        };
         
-        // Force session save
+        // Save session using localSession middleware
         await localSession.saveSession(ctx.session);
         console.log('Session cleared after cancel:', ctx.session);
         
@@ -1440,139 +1526,125 @@ bot.action(/^EDIT_(\d+)$/, async (ctx) => {
         
         console.log(`\n📝 Starting edit process for expense ${expenseId} by user ${userId}`);
 
-        // Get the expense with user_id check
+        // Get the expense first
         db.get(
             `SELECT * FROM expenses WHERE id = ? AND user_id = ?`, 
             [expenseId, userId], 
             async (err, expense) => {
                 if (err) {
                     console.error('Error fetching expense:', err);
-                    await ctx.reply("❌ Error editing expense\\. Please try again\\.", { parse_mode: 'MarkdownV2' });
+                    await ctx.reply("❌ Error editing expense. Please try again.");
                     return;
                 }
 
                 if (!expense) {
-                    console.log(`Expense ${expenseId} not found for user ${userId}`);
-                    await ctx.reply("❌ Expense not found\\.", { parse_mode: 'MarkdownV2' });
+                    await ctx.reply("❌ Expense not found.");
                     return;
                 }
 
-                console.log('Found expense:', expense);
-
-                // Update session state
-                ctx.session.editingExpenseId = parseInt(expenseId);
-                ctx.session.originalCategory = expense.category;
-                ctx.session.originalAmount = expense.amount;
+                // Update session state with original values
+                ctx.session.editingExpenseId = expenseId;
+                ctx.session.editMode = 'amount';
                 ctx.session.userId = userId;
+                ctx.session.originalCategory = expense.category; // Store original category
+                ctx.session.originalAmount = expense.amount;
 
-                // Force session to save
-                await ctx.session.save();
-
-                console.log('Updated session state:', ctx.session);
+                await localSession.saveSession(ctx.session);
 
                 const escapedAmount = expense.amount.toString().replace(/[.\-]/g, '\\$&');
                 const escapedCategory = escapeMarkdownV2(expense.category || 'Uncategorized');
 
                 await ctx.reply(
-                    `✏️ Current expense: \$${escapedAmount} on ${escapedCategory}\n\n` +
+                    `✏️ Editing expense in category: ${escapedCategory}\n` +
+                    `Current amount: \$${escapedAmount}\n\n` +
                     `Send the new amount:`,
                     {
                         parse_mode: 'MarkdownV2',
-                        reply_markup: {
-                            inline_keyboard: [
-                                [Markup.button.callback('❌ Cancel', 'CANCEL')]
-                            ]
-                        }
+                        reply_markup: { remove_keyboard: true }
                     }
                 );
-                console.log('Edit amount prompt sent successfully');
             }
         );
     } catch (error) {
         console.error('Error in EDIT handler:', error);
-        ctx.session.editingExpenseId = null;
-        ctx.session.originalCategory = null;
-        ctx.session.originalAmount = null;
-        ctx.session.userId = null;
-        await ctx.session.save();
-        await ctx.reply("❌ Error editing expense\\. Please try again\\.", { parse_mode: 'MarkdownV2' });
+        await ctx.reply("❌ Error editing expense. Please try again.");
     }
 });
 
-// Update the text handler to handle editing amounts properly
+// Update the text handler to check for editing mode FIRST
 bot.on('text', async (ctx) => {
     try {
         const text = ctx.message.text.trim();
         const userId = ctx.from.id.toString();
 
-        console.log('\n📩 Received text message:', text);
-        console.log('Current session state:', JSON.stringify(ctx.session, null, 2));
-
-        // Check if we're in the middle of editing an amount
-        if (ctx.session?.editingExpenseId && ctx.session.userId === userId) {
+        // Check if we're in edit mode FIRST
+        if (ctx.session?.editingExpenseId && ctx.session?.editMode === 'amount') {
             console.log('Processing amount edit for expense', ctx.session.editingExpenseId);
             
             const amount = parseFloat(text);
             if (isNaN(amount)) {
-                await ctx.reply(
-                    "❌ Please send a valid number\\.",
-                    { parse_mode: 'MarkdownV2' }
-                );
+                await ctx.reply("❌ Please send a valid number.");
                 return;
             }
 
-            const escapedAmount = amount.toString().replace(/[.\-]/g, '\\$&');
-            const escapedCategory = escapeMarkdownV2(ctx.session.originalCategory || 'Uncategorized');
-
-            // Update the expense in the database
-            db.run(
-                `UPDATE expenses SET amount = ? WHERE id = ? AND user_id = ?`,
-                [amount, ctx.session.editingExpenseId, userId],
-                async (err) => {
-                    if (err) {
-                        console.error('Error updating expense:', err);
-                        await ctx.reply("❌ Error updating expense\\. Please try again\\.", { parse_mode: 'MarkdownV2' });
-                        return;
-                    }
-
-                    await ctx.reply(
-                        `✅ Amount updated: \$${escapedAmount} on ${escapedCategory}`,
-                        {
-                            parse_mode: 'MarkdownV2',
-                            reply_markup: {
-                                inline_keyboard: [
-                                    [
-                                        Markup.button.callback('🗑️ Delete', `DELETE_${ctx.session.editingExpenseId}`),
-                                        Markup.button.callback('📊 View Last 5', 'VIEW_EXPENSES')
-                                    ],
-                                    [
-                                        Markup.button.callback('❓ Help', 'SHOW_HELP')
-                                    ]
-                                ]
-                            }
+            try {
+                await new Promise((resolve, reject) => {
+                    db.run(
+                        `UPDATE expenses SET amount = ? WHERE id = ? AND user_id = ?`,
+                        [amount, ctx.session.editingExpenseId, userId],
+                        function(err) {
+                            if (err) reject(err);
+                            else resolve(this);
                         }
                     );
+                });
 
-                    // Clear the editing session
-                    ctx.session.editingExpenseId = null;
-                    ctx.session.originalCategory = null;
-                    ctx.session.originalAmount = null;
-                    ctx.session.userId = null;
-                    await ctx.session.save();
-                }
-            );
-            return;
+                // Store values before clearing session
+                const editedExpenseId = ctx.session.editingExpenseId;
+                const originalCategory = ctx.session.originalCategory || 'Uncategorized';
+
+                // Clear the editing state
+                ctx.session.editingExpenseId = null;
+                ctx.session.editMode = null;
+                ctx.session.originalAmount = null;
+                ctx.session.originalCategory = null;
+                await localSession.saveSession(ctx.session);
+
+                const escapedAmount = amount.toString().replace(/[.\-]/g, '\\$&');
+                const escapedCategory = escapeMarkdownV2(originalCategory);
+
+                await ctx.reply(
+                    `✅ Amount updated: \$${escapedAmount} on ${escapedCategory}`,
+                    {
+                        parse_mode: 'MarkdownV2',
+                        reply_markup: {
+                            inline_keyboard: [
+                                [
+                                    Markup.button.callback('✏️ Edit Amount Again', `EDIT_${editedExpenseId}`),
+                                    Markup.button.callback('📝 Edit Category', `EDITCAT_${editedExpenseId}`)
+                                ],
+                                [
+                                    Markup.button.callback('📊 View Expenses', 'VIEW_EXPENSES'),
+                                    Markup.button.callback('🏠 Main Menu', 'START')
+                                ]
+                            ]
+                        }
+                    }
+                );
+                return;
+            } catch (error) {
+                console.error('Error updating amount:', error);
+                await ctx.reply("❌ Error updating amount. Please try again.");
+                return;
+            }
         }
 
-        // Handle regular expense messages
-        // ... existing code ...
+        // If not in edit mode, proceed with normal message handling
+        // ... rest of your existing message handling code ...
+        
     } catch (error) {
         console.error('Error in text handler:', error);
-        ctx.session.editingExpenseId = null;
-        ctx.session.originalCategory = null;
-        ctx.session.originalAmount = null;
-        ctx.session.userId = null;
-        await ctx.session.save();
+        await ctx.reply("❌ An error occurred. Please try again.");
     }
 });
 
@@ -1582,25 +1654,31 @@ bot.action('cat_other', async (ctx) => {
         await ctx.answerCbQuery();
 
         await ctx.reply(
-            "You can either:\n\n" +
-            "1️⃣ Select from these additional categories:\n" +
-            "Or\n" +
-            "2️⃣ Type your custom category in the format:\n" +
-            "`MainCategory > Subcategory > Type`\n" +
-            "Example: `Hobbies > Gaming > Steam`",
+            "*Additional Categories*\n\n" +
+            "Select from these categories:\n\n" +
+            "• Education & Learning\n" +
+            "• Hobbies & Leisure\n" +
+            "• Gifts & Donations\n" +
+            "• Bills & Utilities",
             {
                 parse_mode: 'MarkdownV2',
                 reply_markup: {
-                    inline_keyboard: addPermanentButtons([
+                    inline_keyboard: [
                         [
-                            { text: "Education", callback_data: "subcat_Education_Studies" },
-                            { text: "Hobbies", callback_data: "subcat_Hobbies_General" }
+                            { text: "📚 Education", callback_data: "subcat_Education_Studies" },
+                            { text: "🎨 Hobbies", callback_data: "subcat_Hobbies_General" }
                         ],
                         [
-                            { text: "Gifts", callback_data: "subcat_Personal_Gifts" },
-                            { text: "Bills", callback_data: "subcat_Home_Bills" }
+                            { text: "🎁 Gifts", callback_data: "subcat_Personal_Gifts" },
+                            { text: "📄 Bills", callback_data: "subcat_Home_Bills" }
+                        ],
+                        [
+                            Markup.button.callback('❓ Help', 'SHOW_HELP')
+                        ],
+                        [
+                            { text: "❌ Cancel", callback_data: "CANCEL" }
                         ]
-                    ])
+                    ]
                 }
             }
         );
@@ -1894,21 +1972,26 @@ bot.action('VIEW_EXPENSES', async (ctx) => {
                 return `📅 ${date}: \$${amount}\n📂 ${category} \\- 🏷️ ${subcategory}`;
             }).join('\n\n');
 
+            // Create buttons for each expense
+            const buttons = expenses.map(exp => [
+                [
+                    Markup.button.callback(`✏️ Edit Amount`, `EDIT_${exp.id}`),
+                    Markup.button.callback(`📝 Edit Category`, `EDITCAT_${exp.id}`)
+                ],
+                [
+                    Markup.button.callback(`🗑️ Delete $${exp.amount} (${exp.category || 'Uncategorized'})`, `DELETE_${exp.id}`)
+                ]
+            ]).flat();
+
+            // Add dashboard button
+            buttons.push([
+                Markup.button.url('🌐 View Dashboard', DASHBOARD_URL)
+            ]);
+
             await ctx.reply(message, {
                 parse_mode: 'MarkdownV2',
                 reply_markup: {
-                        inline_keyboard: [
-                            [
-                                Markup.button.callback('🗑️ Delete', `DELETE_${result.lastID}`),
-                                Markup.button.callback('📊 View Last 5', 'VIEW_EXPENSES')
-                            ],
-                            [
-                                Markup.button.callback('❓ Help', 'SHOW_HELP')
-                            ],
-                            [
-                                Markup.button.url('🌐 View Dashboard', DASHBOARD_URL)
-                            ]
-                    ]
+                    inline_keyboard: buttons
                 }
             });
         });
@@ -1944,10 +2027,12 @@ bot.action('DELETE_LAST', async (ctx) => {
 // Add a new handler for direct expense deletion
 bot.action(/^DELETE_(\d+)$/, async (ctx) => {
     try {
-        await ctx.answerCbQuery();
+        await ctx.answerCbQuery("Deleting expense...");
         const expenseId = ctx.match[1];
         const userId = ctx.from.id.toString();
         
+        console.log(`Attempting to delete expense ${expenseId} for user ${userId}`);
+
         // Get the expense first
         db.get(`SELECT * FROM expenses WHERE id = ? AND user_id = ?`, [expenseId, userId], async (err, expense) => {
             if (err) {
@@ -1961,43 +2046,64 @@ bot.action(/^DELETE_(\d+)$/, async (ctx) => {
                 return;
             }
 
-            // Delete the expense using a Promise to handle the async operation properly
-            await new Promise((resolve, reject) => {
-                db.run(
-                    `DELETE FROM expenses WHERE id = ? AND user_id = ?`,
-                    [expenseId, userId],
-                    function(err) {
-                        if (err) reject(err);
-                        else resolve(this);
-                    }
-                );
-            }).then(async (result) => {
-                const escapedAmount = expense.amount.toString().replace(/[.\-]/g, '\\$&');
-                const escapedCategory = escapeMarkdownV2(expense.category);
+            console.log('Found expense to delete:', expense);
 
+            // Delete the expense using a Promise to handle the async operation properly
+            try {
+                await new Promise((resolve, reject) => {
+                    db.run(
+                        `DELETE FROM expenses WHERE id = ? AND user_id = ?`,
+                        [expenseId, userId],
+                        function(err) {
+                            if (err) {
+                                console.error('SQL error in delete operation:', err);
+                                reject(err);
+                            } else {
+                                console.log('Delete operation result:', this);
+                                resolve(this);
+                            }
+                        }
+                    );
+                });
+
+                // Prepare data for restore button - keep it minimal to avoid Telegram API limits
+                const restoreData = {
+                    a: expense.amount, // amount
+                    c: expense.category, // category
+                    s: expense.subcategory, // subcategory
+                    d: expense.description ? expense.description.substring(0, 50) : '' // truncated description
+                };
+
+                const escapedAmount = expense.amount.toString().replace(/[.\-]/g, '\\$&');
+                const escapedCategory = escapeMarkdownV2(expense.category || 'Uncategorized');
+                const escapedDescription = expense.description ? 
+                    escapeMarkdownV2(expense.description.substring(0, 50)) : 
+                    'No description';
+
+                console.log('Sending delete confirmation message');
                 await ctx.reply(
-                    `🗑️ Deleted expense: \$${escapedAmount} on ${escapedCategory}`,
+                    `🗑️ *Expense deleted successfully*\n\n` +
+                    `Amount: \$${escapedAmount}\n` +
+                    `Category: ${escapedCategory}\n` +
+                    `Description: ${escapedDescription}`,
                     { 
                         parse_mode: 'MarkdownV2',
                         reply_markup: {
                             inline_keyboard: [
                                 [
-                                    Markup.button.callback('↩️ Undo', `RESTORE_${JSON.stringify({
-                                        amount: expense.amount,
-                                        category: expense.category,
-                                        description: expense.description,
-                                        subcategory: expense.subcategory
-                                    })}`),
+                                    Markup.button.callback('↩️ Undo', `RESTORE_${JSON.stringify(restoreData)}`),
                                     Markup.button.callback('📊 View Last 5', 'VIEW_EXPENSES')
                                 ]
                             ]
                         }
                     }
                 );
-            }).catch(async (error) => {
-                console.error('Error deleting expense:', error);
-                await ctx.reply("❌ Failed to delete expense\\.", { parse_mode: 'MarkdownV2' });
-            });
+                console.log('Delete confirmation message sent successfully');
+            } catch (error) {
+                console.error('Error in delete operation:', error);
+                await ctx.reply("❌ Failed to delete expense\\. Error: " + escapeMarkdownV2(error.message), 
+                    { parse_mode: 'MarkdownV2' });
+            }
         });
     } catch (error) {
         console.error('Error in DELETE handler:', error);
@@ -2010,47 +2116,79 @@ bot.action(/^DELETE_(\d+)$/, async (ctx) => {
 // Add handler for restoring deleted expenses
 bot.action(/^RESTORE_(.+)$/, async (ctx) => {
     try {
-        await ctx.answerCbQuery();
-        const data = JSON.parse(ctx.match[1]);
+        await ctx.answerCbQuery("Restoring expense...");
+        console.log('Restore action triggered with data:', ctx.match[1]);
+        
+        // Parse the data with error handling
+        let data;
+        try {
+            data = JSON.parse(ctx.match[1]);
+            console.log('Parsed restore data:', data);
+        } catch (error) {
+            console.error('Error parsing restore data:', error);
+            await ctx.reply("❌ Error restoring expense: Invalid data format", { parse_mode: 'MarkdownV2' });
+            return;
+        }
+        
+        // Map compact keys back to full names
+        const amount = data.a || data.amount || 0;
+        const category = data.c || data.category || 'Uncategorized';
+        const subcategory = data.s || data.subcategory || 'Other';
+        const description = data.d || data.description || '';
         
         // Insert the restored expense with all fields
         const timestamp = new Date().toISOString();
-        const result = await new Promise((resolve, reject) => {
-            db.run(
-                `INSERT INTO expenses (user_id, amount, category, subcategory, description, timestamp) 
-                 VALUES (?, ?, ?, ?, ?, ?)`,
-                [
-                    ctx.from.id.toString(),
-                    data.amount,
-                    data.category,
-                    data.subcategory || 'Other',
-                    data.description || '',
-                    timestamp
-                ],
-                function(err) {
-                    if (err) reject(err);
-                    else resolve(this);
+        console.log('Inserting restored expense:', { amount, category, subcategory, description });
+        
+        try {
+            const result = await new Promise((resolve, reject) => {
+                db.run(
+                    `INSERT INTO expenses (user_id, amount, category, subcategory, description, timestamp) 
+                     VALUES (?, ?, ?, ?, ?, ?)`,
+                    [
+                        ctx.from.id.toString(),
+                        amount,
+                        category,
+                        subcategory,
+                        description,
+                        timestamp
+                    ],
+                    function(err) {
+                        if (err) {
+                            console.error('SQL error in restore operation:', err);
+                            reject(err);
+                        } else {
+                            console.log('Restore operation result:', this);
+                            resolve(this);
+                        }
+                    }
+                );
+            });
+
+            const escapedAmount = amount.toString().replace(/[.\-]/g, '\\$&');
+            const escapedCategory = escapeMarkdownV2(category);
+
+            console.log('Sending restore confirmation message');
+            await ctx.reply(
+                `✅ Restored expense: \$${escapedAmount} on ${escapedCategory}`,
+                {
+                    parse_mode: 'MarkdownV2',
+                    reply_markup: {
+                        inline_keyboard: [
+                            [
+                                Markup.button.callback('✏️ Edit', `EDIT_${result.lastID}`),
+                                Markup.button.callback('📊 View Last 5', 'VIEW_EXPENSES')
+                            ]
+                        ]
+                    }
                 }
             );
-        });
-
-        const escapedAmount = data.amount.toString().replace(/[.\-]/g, '\\$&');
-        const escapedCategory = escapeMarkdownV2(data.category);
-
-        await ctx.reply(
-            `✅ Restored expense: \$${escapedAmount} on ${escapedCategory}`,
-            {
-                parse_mode: 'MarkdownV2',
-                reply_markup: {
-                    inline_keyboard: [
-                        [
-                            Markup.button.callback('✏️ Edit', `EDIT_${result.lastID}`),
-                            Markup.button.callback('📊 View Last 5', 'VIEW_EXPENSES')
-                        ]
-                    ]
-                }
-            }
-        );
+            console.log('Restore confirmation message sent successfully');
+        } catch (error) {
+            console.error('Error in restore operation:', error);
+            await ctx.reply("❌ Error restoring expense: " + escapeMarkdownV2(error.message), 
+                { parse_mode: 'MarkdownV2' });
+        }
     } catch (error) {
         console.error('Error in RESTORE handler:', error);
         await ctx.reply("❌ Error restoring expense\\. Please try again\\.", { parse_mode: 'MarkdownV2' });
@@ -2488,4 +2626,100 @@ process.once('SIGTERM', () => {
         console.log('  └─ Bot stopped');
         console.log('✅ Shutdown complete\n');
     });
+});
+
+// Add this function to handle amount editing if it doesn't exist
+bot.action(/edit_amount_(\d+)/, async (ctx) => {
+    try {
+        const expenseId = ctx.match[1];
+        const userId = ctx.from.id.toString();
+        
+        console.log(`📝 Starting edit amount process for expense ${expenseId} by user ${userId}`);
+        
+        // Store the editing state in the session
+        ctx.session.editingExpenseId = expenseId;
+        ctx.session.editMode = 'amount';
+        ctx.session.userId = userId;
+        
+        // Fetch the current expense to show the user what they're editing
+        db.get('SELECT * FROM expenses WHERE id = ? AND user_id = ?', [expenseId, userId], async (err, expense) => {
+            if (err) {
+                console.error('Error fetching expense for editing:', err);
+                return await ctx.reply('❌ Error fetching expense details. Please try again.');
+            }
+            
+            if (!expense) {
+                return await ctx.reply('❌ Expense not found or you do not have permission to edit it.');
+            }
+            
+            console.log('Found expense:', expense);
+            
+            // Store original amount for reference
+            ctx.session.originalAmount = expense.amount;
+            
+            // Prompt user for new amount
+            await ctx.reply(`Current amount: ${expense.amount}\nPlease enter the new amount:`);
+            console.log('Edit amount prompt sent successfully');
+            console.log('Current session state:', ctx.session);
+        });
+        
+        return await ctx.answerCbQuery('Please enter the new amount');
+    } catch (error) {
+        console.error('Error in edit_amount action:', error);
+        return await ctx.reply('❌ An error occurred. Please try again.');
+    }
+});
+
+// Update the message handler to check for editing mode
+bot.on('message', async (ctx) => {
+    try {
+        // Check if we're in edit mode
+        if (ctx.session.editMode === 'amount' && ctx.session.editingExpenseId) {
+            const text = ctx.message.text.trim();
+            console.log(`Received potential amount edit: ${text}`);
+            
+            // Validate that the input is a number
+            const newAmount = parseFloat(text);
+            if (isNaN(newAmount)) {
+                return await ctx.reply('❌ Please enter a valid number for the amount.');
+            }
+            
+            const expenseId = ctx.session.editingExpenseId;
+            const userId = ctx.session.userId || ctx.from.id.toString();
+            
+            console.log(`Updating expense ${expenseId} amount to ${newAmount}`);
+            
+            // Update the expense in the database
+            db.run(
+                'UPDATE expenses SET amount = ? WHERE id = ? AND user_id = ?',
+                [newAmount, expenseId, userId],
+                async function(err) {
+                    if (err) {
+                        console.error('Error updating expense amount:', err);
+                        return await ctx.reply('❌ Error updating expense. Please try again.');
+                    }
+                    
+                    if (this.changes === 0) {
+                        return await ctx.reply('❌ Expense not found or you do not have permission to edit it.');
+                    }
+                    
+                    // Clear the editing state
+                    ctx.session.editingExpenseId = null;
+                    ctx.session.editMode = null;
+                    ctx.session.originalAmount = null;
+                    
+                    await ctx.reply(`✅ Amount updated from ${ctx.session.originalAmount} to ${newAmount}`);
+                    console.log(`Amount updated successfully for expense ${expenseId}`);
+                }
+            );
+            
+            return;
+        }
+        
+        // If not in edit mode, handle as a regular message
+        // ... existing message handling code ...
+    } catch (error) {
+        console.error('Error in message handler:', error);
+        await ctx.reply('❌ An error occurred. Please try again.');
+    }
 });

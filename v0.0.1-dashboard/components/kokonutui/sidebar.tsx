@@ -13,19 +13,47 @@ import {
   PiggyBank,
   Users,
   CalendarClock,
+  X,
+  CreditCard,
 } from "lucide-react"
 
 import { Home } from "lucide-react"
 import Link from "next/link"
-import { useState } from "react"
+import { useState, useEffect } from "react"
 import Image from "next/image"
 
 export default function Sidebar() {
   const [isMobileMenuOpen, setIsMobileMenuOpen] = useState(false)
+  const [touchStart, setTouchStart] = useState(0)
+  const [touchEnd, setTouchEnd] = useState(0)
 
   function handleNavigation() {
     setIsMobileMenuOpen(false)
   }
+
+  function handleTouchStart(e: React.TouchEvent) {
+    setTouchStart(e.targetTouches[0].clientX)
+  }
+
+  function handleTouchMove(e: React.TouchEvent) {
+    setTouchEnd(e.targetTouches[0].clientX)
+  }
+
+  function handleTouchEnd() {
+    if (touchStart - touchEnd > 75) {
+      // Swipe left
+      setIsMobileMenuOpen(false)
+    }
+    if (touchEnd - touchStart > 75) {
+      // Swipe right
+      setIsMobileMenuOpen(true)
+    }
+  }
+
+  // Close sidebar on route change
+  useEffect(() => {
+    setIsMobileMenuOpen(false)
+  }, [])
 
   function NavItem({
     href,
@@ -40,7 +68,7 @@ export default function Sidebar() {
       <Link
         href={href}
         onClick={handleNavigation}
-        className="flex items-center px-3 py-2 text-sm rounded-md transition-colors text-gray-600 dark:text-gray-300 hover:text-gray-900 dark:hover:text-white hover:bg-gray-50 dark:hover:bg-[#1F1F23]"
+        className="flex items-center px-3 py-2.5 text-sm rounded-md transition-colors text-gray-600 dark:text-gray-300 hover:text-gray-900 dark:hover:text-white hover:bg-gray-50 dark:hover:bg-[#1F1F23] active:bg-gray-100 dark:active:bg-[#2D2D35]"
       >
         <Icon className="h-4 w-4 mr-3 flex-shrink-0" />
         {children}
@@ -52,23 +80,29 @@ export default function Sidebar() {
     <>
       <button
         type="button"
-        className="lg:hidden fixed top-4 left-4 z-[70] p-2 rounded-lg bg-white dark:bg-[#0F0F12] shadow-md"
+        className="lg:hidden fixed top-4 left-4 z-[70] p-2 rounded-lg bg-white dark:bg-[#0F0F12] shadow-md hover:bg-gray-50 dark:hover:bg-[#1F1F23] active:bg-gray-100 dark:active:bg-[#2D2D35] transition-colors"
         onClick={() => setIsMobileMenuOpen(!isMobileMenuOpen)}
+        aria-label={isMobileMenuOpen ? "Close menu" : "Open menu"}
       >
-        <Menu className="h-5 w-5 text-gray-600 dark:text-gray-300" />
+        {isMobileMenuOpen ? (
+          <X className="h-5 w-5 text-gray-600 dark:text-gray-300" />
+        ) : (
+          <Menu className="h-5 w-5 text-gray-600 dark:text-gray-300" />
+        )}
       </button>
       <nav
         className={`
-                fixed inset-y-0 left-0 z-[70] w-64 bg-white dark:bg-[#0F0F12] transform transition-transform duration-200 ease-in-out
-                lg:translate-x-0 lg:static lg:w-64 border-r border-gray-200 dark:border-[#1F1F23]
-                ${isMobileMenuOpen ? "translate-x-0" : "-translate-x-full"}
-            `}
+          fixed inset-y-0 left-0 z-[60] w-72 bg-white dark:bg-[#0F0F12] transform transition-all duration-300 ease-in-out
+          lg:translate-x-0 lg:static lg:w-64 border-r border-gray-200 dark:border-[#1F1F23]
+          ${isMobileMenuOpen ? "translate-x-0 shadow-xl" : "-translate-x-full"}
+        `}
+        onTouchStart={handleTouchStart}
+        onTouchMove={handleTouchMove}
+        onTouchEnd={handleTouchEnd}
       >
         <div className="h-full flex flex-col">
           <Link
-            href="https://kokonutui.com/"
-            target="_blank"
-            rel="noopener noreferrer"
+            href="/"
             className="h-16 px-6 flex items-center border-b border-gray-200 dark:border-[#1F1F23]"
           >
             <div className="flex items-center gap-3">
@@ -92,41 +126,30 @@ export default function Sidebar() {
             </div>
           </Link>
 
-          <div className="flex-1 overflow-y-auto py-4 px-4">
+          <div className="flex-1 overflow-y-auto py-4 px-3">
             <div className="space-y-6">
               <div>
                 <div className="px-3 mb-2 text-xs font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400">
                   Overview
                 </div>
                 <div className="space-y-1">
-                  <NavItem href="#" icon={Home}>
+                  <NavItem href="/dashboard" icon={Home}>
                     Dashboard
                   </NavItem>
-                  <NavItem href="#" icon={BarChart2}>
+                  <NavItem href="/dashboard/analytics" icon={BarChart2}>
                     Analytics
+                  </NavItem>
+                  <NavItem href="/dashboard/transactions" icon={CreditCard}>
+                    Transactions
                   </NavItem>
                   <NavItem href="#" icon={PiggyBank}>
                     Savings
                   </NavItem>
-                  <NavItem href="#" icon={Wallet}>
+                  <NavItem href="#" icon={Users}>
                     Accounts
                   </NavItem>
-                  <NavItem href="#" icon={Users}>
-                    Groups
-                  </NavItem>
-                </div>
-              </div>
-
-              <div>
-                <div className="px-3 mb-2 text-xs font-semibold uppercase tracking-wider text-gray-500 dark:text-gray-400">
-                  Finance
-                </div>
-                <div className="space-y-1">
-                  <NavItem href="#" icon={Wallet}>
-                    Transactions
-                  </NavItem>
                   <NavItem href="#" icon={CalendarClock}>
-                    Recurring Expenses
+                    Schedule
                   </NavItem>
                 </div>
               </div>
@@ -160,9 +183,10 @@ export default function Sidebar() {
         </div>
       </nav>
 
+      {/* Backdrop */}
       {isMobileMenuOpen && (
         <div
-          className="fixed inset-0 bg-black bg-opacity-50 z-[65] lg:hidden"
+          className="fixed inset-0 bg-black/20 backdrop-blur-sm z-[55] lg:hidden"
           onClick={() => setIsMobileMenuOpen(false)}
         />
       )}

@@ -1,4 +1,4 @@
-import { handleUpdate } from '../../../bot';
+import { handleUpdate } from '../../lib/bot';
 
 export default async function handler(req, res) {
   if (req.method !== 'POST') {

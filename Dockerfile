@@ -1,9 +1,9 @@
 # Build stage for the dashboard
 FROM node:18-slim AS dashboard-builder
 WORKDIR /app
-COPY v0.0.1-dashboard/package*.json ./
+COPY package*.json ./
 RUN npm install
-COPY v0.0.1-dashboard/ .
+COPY . .
 RUN npm run build
 
 # Final stage
@@ -15,11 +15,12 @@ COPY package*.json ./
 RUN npm install
 
 # Copy the built dashboard
-COPY --from=dashboard-builder /app/.next ./v0.0.1-dashboard/.next
+COPY --from=dashboard-builder /app/.next ./.next
 
 # Copy bot and server files
-COPY bot.js .
+COPY lib/bot.js ./lib/
 COPY server.js .
+COPY database.js .
 
 # Expose the port
 EXPOSE 8080
