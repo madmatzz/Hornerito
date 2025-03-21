@@ -9,7 +9,8 @@ import {
     Tooltip,
     Legend,
     ChartOptions,
-    Scale
+    Scale,
+    ChartData
 } from 'chart.js';
 import { Line } from 'react-chartjs-2';
 
@@ -33,7 +34,7 @@ interface MonthlyOverviewChartProps {
 }
 
 export function MonthlyOverviewChart({ data }: MonthlyOverviewChartProps) {
-    const chartData = {
+    const chartData: ChartData<'line'> = {
         labels: data.map(item => item.date),
         datasets: [
             {
@@ -48,6 +49,7 @@ export function MonthlyOverviewChart({ data }: MonthlyOverviewChartProps) {
 
     const options: ChartOptions<'line'> = {
         responsive: true,
+        maintainAspectRatio: false,
         plugins: {
             legend: {
                 position: 'top',
@@ -59,6 +61,7 @@ export function MonthlyOverviewChart({ data }: MonthlyOverviewChartProps) {
         },
         scales: {
             y: {
+                type: 'linear',
                 beginAtZero: true,
                 ticks: {
                     callback: function(this: Scale, tickValue: number | string) {
