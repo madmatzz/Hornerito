@@ -18,12 +18,21 @@ const nextConfig = {
     ],
   },
   typescript: {
-    // We're handling type checking in development
+    // !! WARN !!
+    // Dangerously allow production builds to successfully complete even if
+    // your project has type errors.
     ignoreBuildErrors: true,
   },
   experimental: {
     serverComponentsExternalPackages: ['@prisma/client', 'bcrypt']
-  }
+  },
+  webpack: (config) => {
+    config.resolve.fallback = {
+      ...config.resolve.fallback,
+      fs: false,
+    };
+    return config;
+  },
 }
 
 module.exports = nextConfig 
