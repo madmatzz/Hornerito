@@ -6,8 +6,8 @@
   "main": "server.js",
   "scripts": {
     "dev": "next dev",
-    "build": "next build",
-    "start": "node .next/standalone/server.js",
+    "build": "cd v0.0.1-dashboard && next build",
+    "start": "node server.js",
     "lint": "next lint"
   },
   "keywords": [

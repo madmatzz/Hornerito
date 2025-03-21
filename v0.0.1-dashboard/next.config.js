@@ -2,6 +2,7 @@
 const nextConfig = {
   output: 'standalone',
   distDir: '.next',
+  poweredByHeader: false,
   images: {
     remotePatterns: [
       {

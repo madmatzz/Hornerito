@@ -1,5 +1,5 @@
 const express = require('express');
-const next = require('next');
+const path = require('path');
 const TelegramBot = require('node-telegram-bot-api');
 const winston = require('winston');
 const { connectDB } = require('./database');
@@ -43,6 +43,13 @@ server.post('/api/webhook', (req, res) => {
     res.sendStatus(200);
 });
 
+// Serve static files from the standalone build
+server.use(express.static(path.join(__dirname, 'v0.0.1-dashboard/.next/static')));
+server.use('/_next/static', express.static(path.join(__dirname, 'v0.0.1-dashboard/.next/static')));
+
+// Import and use the standalone server
+const nextServer = require('./v0.0.1-dashboard/.next/standalone/server.js');
+
 // Prepare and start the server
 app.prepare().then(() => {
     // Handle all other routes with Next.js
@@ -52,7 +59,15 @@ app.prepare().then(() => {
 
     // Start the server
     server.listen(port, () => {
-        logger.info(`> Ready on http://${hostname}:${port}`);
+        logger.info(`Server is running on port ${port}`);
+        
+        // Set webhook for Telegram bot
+        const webhookUrl = process.env.WEBHOOK_URL || `https://your-render-url.onrender.com/api/webhook`;
+        bot.setWebHook(webhookUrl).then(() => {
+            logger.info('Webhook set successfully');
+        }).catch((error) => {
+            logger.error('Error setting webhook:', error);
+        });
     });
 }).catch((err) => {
     logger.error('Error starting server:', err);
