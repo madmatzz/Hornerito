@@ -4,7 +4,8 @@
     "lib": ["dom", "dom.iterable", "esnext"],
     "allowJs": true,
     "skipLibCheck": true,
-    "strict": false,
+    "strict": true,
+    "strictNullChecks": true,
     "forceConsistentCasingInFileNames": true,
     "noEmit": true,
     "esModuleInterop": true,
@@ -14,24 +15,27 @@
     "isolatedModules": true,
     "jsx": "preserve",
     "incremental": true,
+    "plugins": [
+      {
+        "name": "next"
+      }
+    ],
     "baseUrl": ".",
     "paths": {
-      "@/*": ["./*"]
-    },
-    "types": ["node"]
+      "@/*": ["./*"],
+      "@/components/*": ["./components/*"],
+      "@/lib/*": ["./lib/*"],
+      "@/styles/*": ["./styles/*"],
+      "@/utils/*": ["./utils/*"]
+    }
   },
   "include": [
     "next-env.d.ts",
     "**/*.ts",
     "**/*.tsx",
+    ".next/types/**/*.ts",
     "v0.0.1-dashboard/**/*.ts",
-    "v0.0.1-dashboard/**/*.tsx",
-    ".next/types/**/*.ts"
+    "v0.0.1-dashboard/**/*.tsx"
   ],
-  "exclude": ["node_modules"],
-  "plugins": [
-    {
-      "name": "next"
-    }
-  ]
+  "exclude": ["node_modules"]
 } 
