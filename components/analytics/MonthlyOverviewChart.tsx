@@ -7,7 +7,9 @@ import {
     LineElement,
     Title,
     Tooltip,
-    Legend
+    Legend,
+    ChartOptions,
+    Scale
 } from 'chart.js';
 import { Line } from 'react-chartjs-2';
 
@@ -44,11 +46,11 @@ export function MonthlyOverviewChart({ data }: MonthlyOverviewChartProps) {
         ]
     };
 
-    const options = {
+    const options: ChartOptions<'line'> = {
         responsive: true,
         plugins: {
             legend: {
-                position: 'top' as const,
+                position: 'top',
             },
             title: {
                 display: true,
@@ -59,7 +61,9 @@ export function MonthlyOverviewChart({ data }: MonthlyOverviewChartProps) {
             y: {
                 beginAtZero: true,
                 ticks: {
-                    callback: (value: number) => `$${value.toFixed(2)}`
+                    callback: function(this: Scale, tickValue: number | string) {
+                        return `$${Number(tickValue).toFixed(2)}`;
+                    }
                 }
             }
         }
