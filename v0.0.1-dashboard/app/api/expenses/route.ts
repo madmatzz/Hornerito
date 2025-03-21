@@ -1,49 +1,43 @@
 import { NextResponse } from 'next/server';
+import { prisma } from '@/lib/prisma';
 
 export const dynamic = 'force-dynamic';
 export const revalidate = 0;
 
-// Mock data store
-let mockExpenses = [
-  {
-    id: 1,
-    amount: 50.00,
-    description: "Groceries",
-    category: "Food",
-    date: new Date().toISOString(),
-  },
-  {
-    id: 2,
-    amount: 30.00,
-    description: "Gas",
-    category: "Transportation",
-    date: new Date().toISOString(),
-  }
-];
-
 export async function GET() {
-  try {
-    return NextResponse.json(mockExpenses);
-  } catch (error) {
-    console.error('Error fetching expenses:', error);
-    return NextResponse.json({ error: 'Failed to fetch expenses' }, { status: 500 });
-  }
+    try {
+        const expenses = await prisma.expense.findMany({
+            orderBy: {
+                date: 'desc'
+            }
+        });
+        return NextResponse.json(expenses);
+    } catch (error) {
+        console.error('Error fetching expenses:', error);
+        return NextResponse.json(
+            { error: 'Failed to fetch expenses' },
+            { status: 500 }
+        );
+    }
 }
 
 export async function POST(request: Request) {
-  try {
-    const body = await request.json();
-    const newExpense = {
-      id: mockExpenses.length + 1,
-      amount: body.amount,
-      description: body.description,
-      category: body.category,
-      date: body.date || new Date().toISOString(),
-    };
-    mockExpenses.push(newExpense);
-    return NextResponse.json({ message: 'Expense added successfully', expense: newExpense });
-  } catch (error) {
-    console.error('Error adding expense:', error);
-    return NextResponse.json({ error: 'Failed to add expense' }, { status: 500 });
-  }
+    try {
+        const data = await request.json();
+        const expense = await prisma.expense.create({
+            data: {
+                amount: data.amount,
+                category: data.category,
+                description: data.description,
+                date: new Date(data.date)
+            }
+        });
+        return NextResponse.json(expense, { status: 201 });
+    } catch (error) {
+        console.error('Error creating expense:', error);
+        return NextResponse.json(
+            { error: 'Failed to create expense' },
+            { status: 500 }
+        );
+    }
 } 
