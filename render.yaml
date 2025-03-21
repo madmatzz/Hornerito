@@ -2,7 +2,11 @@ services:
   - type: web
     name: hornerito-bot
     env: node
-    buildCommand: cd v0.0.1-dashboard && npm install && npm run build
+    buildCommand: |
+      npm install
+      cd v0.0.1-dashboard
+      npm install tailwindcss lucide-react date-fns recharts @radix-ui/react-dialog @radix-ui/react-dropdown-menu @radix-ui/react-slot @radix-ui/react-toast
+      npm run build
     startCommand: node server.js
     envVars:
       - key: NODE_ENV
