@@ -2,13 +2,24 @@
   "name": "hornerito-bot",
   "version": "1.0.0",
   "private": true,
+  "description": "Telegram bot for expense tracking with web dashboard",
+  "main": "server.js",
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "start": "next start",
+    "start": "node .next/standalone/server.js",
     "lint": "next lint"
   },
+  "keywords": [
+    "telegram",
+    "bot",
+    "expenses",
+    "dashboard"
+  ],
+  "author": "",
+  "license": "ISC",
   "dependencies": {
+    "@prisma/client": "^6.5.0",
     "@types/node": "^20.0.0",
     "@types/react": "^18.0.0",
     "@types/react-dom": "^18.0.0",
@@ -20,6 +31,7 @@
     "next": "14.2.25",
     "node-telegram-bot-api": "^0.64.0",
     "openai": "^4.0.0",
+    "prisma": "^6.5.0",
     "react": "^18.0.0",
     "react-chartjs-2": "^5.2.0",
     "react-dom": "^18.0.0",
