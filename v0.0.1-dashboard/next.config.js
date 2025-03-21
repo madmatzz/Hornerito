@@ -21,6 +21,9 @@ const nextConfig = {
     // We're handling type checking in development
     ignoreBuildErrors: true,
   },
+  experimental: {
+    serverComponentsExternalPackages: ['@prisma/client', 'bcrypt']
+  }
 }
 
 module.exports = nextConfig 
